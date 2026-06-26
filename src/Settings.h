@@ -341,6 +341,32 @@ struct TabGroup {
     Vec<TabFile*>* tabFiles;
 };
 
+// persisted visual tab group membership
+struct VisualTabGroupRef {
+    // visual tab group id for this tab or file
+    int groupId;
+    // name of the referenced visual tab group
+    char* name;
+    // color of the referenced visual tab group
+    char* color;
+    ParsedColor colorParsed;
+    // collapsed flag copied from the visual tab group
+    bool collapsed;
+};
+
+// visual tab groups for this window
+struct PersistedVisualTabGroup {
+    // stable visual tab group id
+    int id;
+    // name of the visual tab group
+    char* name;
+    // color of the visual tab group
+    char* color;
+    ParsedColor colorParsed;
+    // if true, the visual tab group is collapsed
+    bool collapsed;
+};
+
 // Values which are persisted for bookmarks/favorites
 struct Favorite {
     // name of this favorite as shown in the menu
@@ -420,6 +446,8 @@ struct FileState {
     // that we only have to save a diff instead of all states for the whole
     // tree (which can be quite large) (internal)
     Vec<int>* tocState;
+    // persisted visual tab group membership
+    VisualTabGroupRef visualTabGroup;
     // thumbnails are saved as PNG files in sumatrapdfcache directory
     RenderedBitmap* thumbnail;
     // temporary value needed for FileHistory::cmpOpenCount
@@ -450,6 +478,8 @@ struct TabState {
     bool showToc;
     // same as FileStates -> TocState
     Vec<int>* tocState;
+    // persisted visual tab group membership
+    VisualTabGroupRef visualTabGroup;
 };
 
 // state of the last session, usage depends on RestoreSession
@@ -465,6 +495,8 @@ struct SessionData {
     Rect windowPos;
     // width of favorites/bookmarks sidebar (if shown)
     int sidebarDx;
+    // visual tab groups for this window
+    Vec<PersistedVisualTabGroup*>* visualTabGroups;
 };
 
 // Preferences are persisted in SumatraPDF-settings.txt
@@ -905,6 +937,25 @@ static const FieldInfo gTabGroupFields[] = {
 };
 static const StructInfo gTabGroupInfo = {sizeof(TabGroup), 2, gTabGroupFields, "Name\0TabFiles"};
 
+static const FieldInfo gVisualTabGroupRefFields[] = {
+    {offsetof(VisualTabGroupRef, groupId), SettingType::Int, -1},
+    {offsetof(VisualTabGroupRef, name), SettingType::String, 0},
+    {offsetof(VisualTabGroupRef, color), SettingType::Color, 0},
+    {offsetof(VisualTabGroupRef, collapsed), SettingType::Bool, false},
+};
+static const StructInfo gVisualTabGroupRefInfo = {sizeof(VisualTabGroupRef), 4, gVisualTabGroupRefFields,
+                                                  "GroupId\0Name\0Color\0Collapsed"};
+
+static const FieldInfo gPersistedVisualTabGroupFields[] = {
+    {offsetof(PersistedVisualTabGroup, id), SettingType::Int, -1},
+    {offsetof(PersistedVisualTabGroup, name), SettingType::String, 0},
+    {offsetof(PersistedVisualTabGroup, color), SettingType::Color, 0},
+    {offsetof(PersistedVisualTabGroup, collapsed), SettingType::Bool, false},
+};
+static const StructInfo gPersistedVisualTabGroupInfo = {sizeof(PersistedVisualTabGroup), 4,
+                                                        gPersistedVisualTabGroupFields,
+                                                        "Id\0Name\0Color\0Collapsed"};
+
 static const FieldInfo gRectFields[] = {
     {offsetof(Rect, x), SettingType::Int, 0},
     {offsetof(Rect, y), SettingType::Int, 0},
@@ -964,11 +1015,12 @@ static const FieldInfo gFileStateFields[] = {
     {offsetof(FileState, tabCol), SettingType::Color, (intptr_t)""},
     {offsetof(FileState, reparseIdx), SettingType::Int, 0},
     {offsetof(FileState, tocState), SettingType::IntArray, 0},
+    {offsetof(FileState, visualTabGroup), SettingType::Struct, (intptr_t)&gVisualTabGroupRefInfo},
 };
 static StructInfo gFileStateInfo = {
-    sizeof(FileState), 21, gFileStateFields,
+    sizeof(FileState), 22, gFileStateFields,
     "FilePath\0Favorites\0IsPinned\0IsMissing\0OpenCount\0DecryptionKey\0UseDefaultState\0DisplayMode\0ScrollPos\0PageN"
-    "o\0Zoom\0Rotation\0WindowState\0WindowPos\0ShowToc\0SidebarDx\0DisplayR2L\0BgCol\0TabCol\0ReparseIdx\0TocState"};
+    "o\0Zoom\0Rotation\0WindowState\0WindowPos\0ShowToc\0SidebarDx\0DisplayR2L\0BgCol\0TabCol\0ReparseIdx\0TocState\0VisualTabGroup"};
 
 static const FieldInfo gPointF_1_Fields[] = {
     {offsetof(PointF, x), SettingType::Float, (intptr_t)"0"},
@@ -985,9 +1037,10 @@ static const FieldInfo gTabStateFields[] = {
     {offsetof(TabState, scrollPos), SettingType::Compact, (intptr_t)&gPointF_1_Info},
     {offsetof(TabState, showToc), SettingType::Bool, true},
     {offsetof(TabState, tocState), SettingType::IntArray, 0},
+    {offsetof(TabState, visualTabGroup), SettingType::Struct, (intptr_t)&gVisualTabGroupRefInfo},
 };
-static const StructInfo gTabStateInfo = {sizeof(TabState), 8, gTabStateFields,
-                                         "FilePath\0DisplayMode\0PageNo\0Zoom\0Rotation\0ScrollPos\0ShowToc\0TocState"};
+static const StructInfo gTabStateInfo = {sizeof(TabState), 9, gTabStateFields,
+                                         "FilePath\0DisplayMode\0PageNo\0Zoom\0Rotation\0ScrollPos\0ShowToc\0TocState\0VisualTabGroup"};
 
 static const FieldInfo gRect_3_Fields[] = {
     {offsetof(Rect, x), SettingType::Int, 0},
@@ -1003,9 +1056,10 @@ static const FieldInfo gSessionDataFields[] = {
     {offsetof(SessionData, windowState), SettingType::Int, 0},
     {offsetof(SessionData, windowPos), SettingType::Compact, (intptr_t)&gRect_3_Info},
     {offsetof(SessionData, sidebarDx), SettingType::Int, 0},
+    {offsetof(SessionData, visualTabGroups), SettingType::Array, (intptr_t)&gPersistedVisualTabGroupInfo},
 };
-static const StructInfo gSessionDataInfo = {sizeof(SessionData), 5, gSessionDataFields,
-                                            "TabStates\0TabIndex\0WindowState\0WindowPos\0SidebarDx"};
+static const StructInfo gSessionDataInfo = {sizeof(SessionData), 6, gSessionDataFields,
+                                            "TabStates\0TabIndex\0WindowState\0WindowPos\0SidebarDx\0VisualTabGroups"};
 
 static const FieldInfo gFILETIMEFields[] = {
     {offsetof(FILETIME, dwHighDateTime), SettingType::Int, 0},
@@ -1164,3 +1218,4 @@ static const FieldInfo gThemesFields[] = {
 static const StructInfo gThemesInfo = {sizeof(Themes), 1, gThemesFields, "Themes"};
 
 #endif
+

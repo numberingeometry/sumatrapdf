@@ -188,6 +188,20 @@ const tabGroup: Field[] = [
   mkArray("TabFiles", tabFile, "files in the tab group"),
 ];
 
+const visualTabGroup: Field[] = [
+  mkField("Id", Int, -1, "stable visual tab group id"),
+  mkField("Name", Str, null, "name of the visual tab group"),
+  mkField("Color", Color, null, "color of the visual tab group"),
+  mkField("Collapsed", Bool, false, "if true, the visual tab group is collapsed"),
+];
+
+const visualTabRef: Field[] = [
+  mkField("GroupId", Int, -1, "visual tab group id for this tab or file"),
+  mkField("Name", Str, null, "name of the referenced visual tab group"),
+  mkField("Color", Color, null, "color of the referenced visual tab group"),
+  mkField("Collapsed", Bool, false, "collapsed flag copied from the visual tab group"),
+];
+
 const windowPos: Field[] = [
   mkField("X", Int, 0, "x coordinate"),
   mkField("Y", Int, 0, "y coordinate"),
@@ -647,6 +661,13 @@ const fileSettings: Field[] = [
     ),
     "data required to determine which parts of the table of contents have been expanded",
   ),
+  setVersion(
+    setStructName(
+      mkStruct("VisualTabGroup", visualTabRef, "persisted visual tab group membership"),
+      "VisualTabGroupRef",
+    ),
+    "3.7",
+  ),
   notSaved(
     mkField(
       "Thumbnail",
@@ -674,6 +695,13 @@ const tabState: Field[] = [
   ),
   mkField("ShowToc", Bool, true, "if true, the table of contents was shown when the document was closed"),
   mkCompactArray("TocState", Int, null, "same as FileStates -> TocState"),
+  setVersion(
+    setStructName(
+      mkStruct("VisualTabGroup", visualTabRef, "persisted visual tab group membership"),
+      "VisualTabGroupRef",
+    ),
+    "3.7",
+  ),
 ];
 
 const sessionData: Field[] = [
@@ -690,6 +718,13 @@ const sessionData: Field[] = [
   mkField("WindowState", Int, 0, "same as FileState -> WindowState"),
   setStructName(mkCompactStruct("WindowPos", windowPos, "default position (can be on any monitor)"), "Rect"),
   mkField("SidebarDx", Int, 0, "width of favorites/bookmarks sidebar (if shown)"),
+  setVersion(
+    setStructName(
+      mkArray("VisualTabGroups", visualTabGroup, "visual tab groups for this window"),
+      "PersistedVisualTabGroup",
+    ),
+    "3.7",
+  ),
 ];
 
 const globalPrefs: Field[] = [
@@ -2016,3 +2051,4 @@ export async function main() {
 if (import.meta.main) {
   await main();
 }
+

@@ -671,6 +671,7 @@ void UpdateTabFileDisplayStateForTab(WindowTab* tab) {
     tab->ctrl->GetDisplayState(fs);
     UpdateDisplayStateWindowRect(win, fs, false);
     UpdateSidebarDisplayState(tab, fs);
+    SaveVisualTabGroupToFileState(win->visualTabGroups, tab, fs);
 }
 
 static bool gForceRtl = false;
@@ -1549,6 +1550,10 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         if (tabColParsed->parsedOk) {
             tab->tabColor = tabColParsed->col;
         }
+        if (fs == gFileHistory.FindByPath(path)) {
+            RestoreVisualTabGroupFromFileState(win->visualTabGroups, tab, fs);
+            UpdateVisualTabGroupState(win, tab);
+        }
     }
 
     AbortFinding(args->win, true);
@@ -2165,6 +2170,7 @@ MainWindow* CreateAndShowMainWindow(SessionData* data, bool showWin) {
         windowState = data->windowState;
         Rect rect = ShiftRectToWorkArea(data->windowPos);
         MoveWindow(win->hwndFrame, rect);
+        RestoreVisualTabGroupsFromSessionData(win->visualTabGroups, data);
         // TODO: also restore data->sidebarDx
     }
 
@@ -2443,8 +2449,12 @@ MainWindow* LoadDocumentFinish(LoadArgs* args) {
     // real loading so restore tab state
     if (!currTab->ctrl && !currTab->tabState) {
         currTab->tabState = args->tabState;
+        RestoreVisualTabGroupFromTabState(win->visualTabGroups, currTab, args->tabState);
+        UpdateVisualTabGroupState(win, currTab);
     } else if (currTab->tabState) {
         SetTabState(currTab, currTab->tabState);
+        RestoreVisualTabGroupFromTabState(win->visualTabGroups, currTab, currTab->tabState);
+        UpdateVisualTabGroupState(win, currTab);
         currTab->tabState = nullptr;
     }
     // TODO: figure why we hit this.
@@ -3603,6 +3613,12 @@ bool CanCloseWindow(MainWindow* win) {
    menu item. */
 void CloseWindow(MainWindow* win, bool quitIfLast, bool forceClose) {
     if (!win) {
+        return;
+    }
+    // WM_DESTROY can re-enter after we've already removed the window from
+    // gWindows and saved the last-window session state. Ignore that pass so it
+    // can't re-save an empty session snapshot over the correct one.
+    if (forceClose && !gWindows.Contains(win)) {
         return;
     }
     // guard against reentrant CloseWindow calls triggered by Windows theme
@@ -10719,3 +10735,5 @@ void ShutdownCleanup() {
     gAllowedFileTypes.Reset();
     gAllowedLinkProtocols.Reset();
 }
+
+

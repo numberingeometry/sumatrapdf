@@ -395,6 +395,10 @@ static TabState* CloneTabState(const TabState* src) {
     dst->scrollPos = src->scrollPos;
     dst->showToc = src->showToc;
     dst->tocState = new Vec<int>(*src->tocState);
+    dst->visualTabGroup.groupId = src->visualTabGroup.groupId;
+    dst->visualTabGroup.name = str::Dup(src->visualTabGroup.name);
+    dst->visualTabGroup.color = str::Dup(src->visualTabGroup.color);
+    dst->visualTabGroup.collapsed = src->visualTabGroup.collapsed;
     return dst;
 }
 
@@ -404,6 +408,14 @@ static SessionData* CloneSessionData(const SessionData* src) {
     dst->windowState = src->windowState;
     dst->windowPos = src->windowPos;
     dst->sidebarDx = src->sidebarDx;
+    for (PersistedVisualTabGroup* group : *src->visualTabGroups) {
+        auto* dstGroup = new PersistedVisualTabGroup();
+        dstGroup->id = group->id;
+        dstGroup->name = str::Dup(group->name);
+        dstGroup->color = str::Dup(group->color);
+        dstGroup->collapsed = group->collapsed;
+        dst->visualTabGroups->Append(dstGroup);
+    }
     for (TabState* ts : *src->tabStates) {
         dst->tabStates->Append(CloneTabState(ts));
     }
@@ -496,6 +508,7 @@ static void RememberSessionState() {
 
     for (auto* win : gWindows) {
         SessionData* windowState = NewSessionData();
+        SaveVisualTabGroupsToSessionData(win->visualTabGroups, windowState);
         for (WindowTab* tab : win->Tabs()) {
             if (!tab->filePath) {
                 // home page tab
@@ -522,7 +535,9 @@ static void RememberSessionState() {
             tab->ctrl->GetDisplayState(fs);
             fs->showToc = tab->showToc;
             *fs->tocState = tab->tocState;
+            SaveVisualTabGroupToFileState(win->visualTabGroups, tab, fs);
             TabState* ts = NewTabState(fs);
+            SaveVisualTabGroupToTabState(win->visualTabGroups, tab, ts);
             windowState->tabStates->Append(ts);
             DeleteFileState(fs);
         }
