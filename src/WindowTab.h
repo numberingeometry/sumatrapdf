@@ -65,6 +65,9 @@ struct WindowTab {
     // per-document tab color from FileState; kColorUnset = use default
     COLORREF tabColor = kColorUnset;
 
+    // live in-window tab grouping; -1 means no group
+    int visualTabGroupId = -1;
+
     // TODO: arguably a hack
     bool ignoreNextAutoReload = false;
 

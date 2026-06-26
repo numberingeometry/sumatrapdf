@@ -62,6 +62,7 @@ struct DocControllerCallback;
 struct ChmModel;
 struct DisplayModel;
 struct WindowTab;
+struct MainWindow;
 
 struct Annotation;
 struct ILinkHandler;
@@ -102,6 +103,102 @@ struct StaticLink {
     ~StaticLink();
 };
 
+static inline COLORREF DefaultVisualTabGroupColor(int id) {
+    static COLORREF colors[] = {
+        MkColor(213, 90, 90),
+        MkColor(219, 144, 65),
+        MkColor(201, 176, 59),
+        MkColor(94, 166, 91),
+        MkColor(81, 151, 214),
+        MkColor(137, 115, 210),
+    };
+    int nColors = dimof(colors);
+    if (id <= 0 || nColors == 0) {
+        return MkColor(213, 90, 90);
+    }
+    return colors[(id - 1) % nColors];
+}
+
+struct VisualTabGroup {
+    int id = 0;
+    char* name = nullptr;
+    COLORREF color = kColorUnset;
+    bool collapsed = false;
+
+    ~VisualTabGroup() {
+        str::Free(name);
+    }
+};
+
+struct VisualTabGroupState {
+    Vec<VisualTabGroup*> groups;
+    int nextId = 1;
+
+    ~VisualTabGroupState() {
+        DeleteVecMembers(groups);
+    }
+
+    void Reset() {
+        DeleteVecMembers(groups);
+        groups.Reset();
+        nextId = 1;
+    }
+
+    VisualTabGroup* CreateGroup(const char* name, COLORREF color) {
+        return CreateGroupWithId(nextId, name, color);
+    }
+
+    VisualTabGroup* CreateGroupWithId(int id, const char* name, COLORREF color) {
+        auto* group = new VisualTabGroup();
+        group->id = id;
+        group->name = str::Dup(name ? name : "");
+        group->color = color;
+        groups.Append(group);
+        if (nextId <= id) {
+            nextId = id + 1;
+        }
+        return group;
+    }
+
+    VisualTabGroup* CreateDefaultGroup() {
+        int id = nextId;
+        TempStr name = str::FormatTemp("Group %d", id);
+        return CreateGroupWithId(id, name, DefaultVisualTabGroupColor(id));
+    }
+
+    VisualTabGroup* FindGroup(int id) const {
+        for (VisualTabGroup* group : groups) {
+            if (group->id == id) {
+                return group;
+            }
+        }
+        return nullptr;
+    }
+
+    void DeleteGroup(VisualTabGroup* group) {
+        if (!group) {
+            return;
+        }
+        groups.Remove(group);
+        delete group;
+    }
+
+    void DeleteGroupById(int id) {
+        DeleteGroup(FindGroup(id));
+    }
+};
+
+void SetVisualTabGroup(WindowTab* tab, VisualTabGroup* group);
+void ClearVisualTabGroup(WindowTab* tab);
+COLORREF GetEffectiveTabColor(const VisualTabGroupState& state, const WindowTab* tab);
+void SaveVisualTabGroupToFileState(const VisualTabGroupState& state, const WindowTab* tab, FileState* fs);
+void SaveVisualTabGroupToTabState(const VisualTabGroupState& state, const WindowTab* tab, TabState* ts);
+void RestoreVisualTabGroupFromFileState(VisualTabGroupState& state, WindowTab* tab, const FileState* fs);
+void RestoreVisualTabGroupFromTabState(VisualTabGroupState& state, WindowTab* tab, const TabState* ts);
+void SaveVisualTabGroupsToSessionData(const VisualTabGroupState& state, SessionData* sd);
+void RestoreVisualTabGroupsFromSessionData(VisualTabGroupState& state, const SessionData* sd);
+void UpdateVisualTabGroupState(MainWindow* win, WindowTab* tab);
+
 /* Describes information related to one window with (optional) a document
    on the screen */
 struct MainWindow {
@@ -129,6 +226,7 @@ struct MainWindow {
     Vec<WindowTab*> Tabs() const;
     WindowTab* GetTab(int idx) const;
     int GetTabIdx(WindowTab*) const;
+    VisualTabGroupState visualTabGroups;
 
     HWND hwndFrame = nullptr;
     HWND hwndCanvas = nullptr;
@@ -454,3 +552,5 @@ void OpenSystemMenu(MainWindow* win);
 // strips mupdf's "nameddest=" prefix from a remote link's destination name
 // so it can be passed to GetNamedDest (issue #5642)
 const char* CleanRemoteDestName(const char* destName);
+
+

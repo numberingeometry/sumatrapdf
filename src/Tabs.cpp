@@ -113,13 +113,124 @@ void UpdateTabWidth(MainWindow* win) {
     ShowTabBar(win, true);
 }
 
+constexpr UINT_PTR CmdCreateVisualTabGroup = 50000;
+constexpr UINT_PTR CmdRemoveVisualTabGroup = 50001;
+constexpr UINT_PTR CmdAddToVisualTabGroupBase = 50100;
+
+static void DeleteVisualTabGroupIfEmpty(MainWindow* win, int groupId) {
+    if (!win || groupId == -1) {
+        return;
+    }
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab->visualTabGroupId == groupId) {
+            return;
+        }
+    }
+    win->visualTabGroups.DeleteGroupById(groupId);
+}
+
+static VisualTabGroup* CloneVisualTabGroupToWindow(MainWindow* win, const VisualTabGroup* src) {
+    if (!win || !src) {
+        return nullptr;
+    }
+    VisualTabGroup* existing = win->visualTabGroups.FindGroup(src->id);
+    if (existing) {
+        return existing;
+    }
+    return win->visualTabGroups.CreateGroupWithId(src->id, src->name, src->color);
+}
+
+static void UpdateTabVisualGroupState(MainWindow* win, WindowTab* tab) {
+    if (!win || !tab || !win->tabsCtrl) {
+        return;
+    }
+    int idx = win->GetTabIdx(tab);
+    if (idx < 0) {
+        return;
+    }
+    TabInfo* ti = win->tabsCtrl->GetTab(idx);
+    if (!ti) {
+        return;
+    }
+    ti->tabColor = GetEffectiveTabColor(win->visualTabGroups, tab);
+    ti->visualTabGroupId = tab->visualTabGroupId;
+}
+
+static void AssignTabToVisualGroup(MainWindow* win, WindowTab* tab, VisualTabGroup* group) {
+    if (!win || !tab || !group) {
+        return;
+    }
+    int oldGroupId = tab->visualTabGroupId;
+    SetVisualTabGroup(tab, group);
+    UpdateTabVisualGroupState(win, tab);
+    DeleteVisualTabGroupIfEmpty(win, oldGroupId);
+    win->tabsCtrl->ScheduleRepaint();
+}
+
+static void RemoveTabFromVisualGroup(MainWindow* win, WindowTab* tab) {
+    if (!win || !tab) {
+        return;
+    }
+    int oldGroupId = tab->visualTabGroupId;
+    ClearVisualTabGroup(tab);
+    UpdateTabVisualGroupState(win, tab);
+    DeleteVisualTabGroupIfEmpty(win, oldGroupId);
+    win->tabsCtrl->ScheduleRepaint();
+}
+
+static VisualTabGroup* GetVisualTabGroupForMenuCmd(MainWindow* win, WindowTab* currentTab, UINT_PTR cmdId) {
+    int idx = (int)(cmdId - CmdAddToVisualTabGroupBase);
+    if (idx < 0) {
+        return nullptr;
+    }
+    int seen = 0;
+    for (VisualTabGroup* group : win->visualTabGroups.groups) {
+        if (group->id == currentTab->visualTabGroupId) {
+            continue;
+        }
+        if (seen == idx) {
+            return group;
+        }
+        seen++;
+    }
+    return nullptr;
+}
+
+static void AddVisualTabGroupMenuItems(HMENU popup, MainWindow* win, WindowTab* tabUnderMouse) {
+    UINT flags = MF_BYCOMMAND | MF_STRING | MF_ENABLED;
+    InsertMenuW(popup, CmdSetTabColor, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
+    if (tabUnderMouse->visualTabGroupId != -1) {
+        InsertMenuW(popup, CmdSetTabColor, flags, CmdRemoveVisualTabGroup, ToWStrTemp(_TRN("Ungroup")));
+    }
+
+    HMENU addToGroup = CreatePopupMenu();
+    bool hasGroups = false;
+    int menuIdx = 0;
+    for (VisualTabGroup* group : win->visualTabGroups.groups) {
+        if (group->id == tabUnderMouse->visualTabGroupId) {
+            continue;
+        }
+        AppendMenuW(addToGroup, MF_STRING | MF_ENABLED, CmdAddToVisualTabGroupBase + menuIdx, ToWStrTemp(group->name));
+        menuIdx++;
+        hasGroups = true;
+    }
+    if (!hasGroups) {
+        AppendMenuW(addToGroup, MF_STRING | MF_GRAYED, 0, ToWStrTemp(_TRN("(No groups)")));
+    }
+    UINT submenuFlags = MF_BYCOMMAND | MF_POPUP | (hasGroups ? MF_ENABLED : MF_GRAYED);
+    InsertMenuW(popup, CmdSetTabColor, submenuFlags, (UINT_PTR)addToGroup, ToWStrTemp(_TRN("Add To Tab Group")));
+    InsertMenuW(popup, CmdSetTabColor, flags, CmdCreateVisualTabGroup, ToWStrTemp(_TRN("New Tab Group")));
+}
+
 void RemoveTab(WindowTab* tab) {
     UpdateTabFileDisplayStateForTab(tab);
     MainWindow* win = tab->win;
+    int groupId = tab->visualTabGroupId;
     win->tabSelectionHistory->Remove(tab);
     int idx = win->GetTabIdx(tab);
     WindowTab* tab2 = win->tabsCtrl->RemoveTab<WindowTab*>(idx);
     ReportIf(tab != tab2);
+    DeleteVisualTabGroupIfEmpty(win, groupId);
     bool closedCurrentTab = (tab == win->CurrentTab());
     if (closedCurrentTab) {
         win->ctrl = nullptr;
@@ -179,6 +290,7 @@ static void CloseWindowIfNoDocuments(MainWindow* win) {
 
 static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt) {
     MainWindow* oldWin = tab->win;
+    VisualTabGroup* oldGroup = oldWin->visualTabGroups.FindGroup(tab->visualTabGroupId);
 
     // don't migrate if it's only one document tab and not
     // dragging over a window
@@ -239,6 +351,7 @@ static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt)
     WindowTab* newTab = new WindowTab(newWin);
     newTab->SetFilePath(tab->filePath);
     newTab->SetDisplayName(tab->displayName);
+    SetVisualTabGroup(newTab, CloneVisualTabGroupToWindow(newWin, oldGroup));
     newWin->currentTabTemp = AddTabToWindow(newWin, newTab);
     newWin->ctrl = nullptr;
     LoadArgs args(tab->filePath, newWin);
@@ -450,8 +563,9 @@ static void TabsContextMenu(ContextMenuEvent* ev) {
 
     HMENU popup = BuildMenuFromDef(menuDefContextTab, CreatePopupMenu(), ctx);
     DeleteBuildMenuCtx(ctx);
+    AddVisualTabGroupMenuItems(popup, win, tabUnderMouse);
 
-    if (!tabUnderMouse->ctrl) {
+    if (!tabUnderMouse->ctrl || tabUnderMouse->visualTabGroupId != -1) {
         MenuSetEnabled(popup, CmdSetTabColor, false);
     }
     // the save/discard items only make sense when the document has unsaved
@@ -469,6 +583,15 @@ static void TabsContextMenu(ContextMenuEvent* ev) {
     FreeMenuOwnerDrawInfoData(popup);
     DestroyMenu(popup);
     switch (cmdId) {
+        case CmdCreateVisualTabGroup: {
+            VisualTabGroup* group = win->visualTabGroups.CreateDefaultGroup();
+            AssignTabToVisualGroup(win, tabUnderMouse, group);
+            return;
+        }
+        case CmdRemoveVisualTabGroup: {
+            RemoveTabFromVisualGroup(win, tabUnderMouse);
+            return;
+        }
         case CmdClose: {
             CloseTab(tabUnderMouse, false);
             return;
@@ -556,6 +679,13 @@ static void TabsContextMenu(ContextMenuEvent* ev) {
             // revert to the on-disk version, discarding unsaved changes
             TabsSelect(win, tabIdx);
             ReloadDocument(win, false);
+            return;
+        }
+    }
+    if (cmdId >= CmdAddToVisualTabGroupBase) {
+        VisualTabGroup* group = GetVisualTabGroupForMenuCmd(win, tabUnderMouse, cmdId);
+        if (group) {
+            AssignTabToVisualGroup(win, tabUnderMouse, group);
             return;
         }
     }
@@ -714,7 +844,8 @@ WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab) {
     newTab->text = str::Dup(tab->GetTabTitle());
     newTab->tooltip = str::Dup(tab->filePath);
     newTab->userData = (UINT_PTR)tab;
-    newTab->tabColor = tab->tabColor;
+    newTab->tabColor = GetEffectiveTabColor(win->visualTabGroups, tab);
+    newTab->visualTabGroupId = tab->visualTabGroupId;
 
     int insertedIdx = tabs->InsertTab(idx, newTab);
     ReportIf(insertedIdx == -1);

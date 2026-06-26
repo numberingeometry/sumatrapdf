@@ -84,6 +84,164 @@ StaticLink::~StaticLink() {
     str::Free(tooltip);
 }
 
+void SetVisualTabGroup(WindowTab* tab, VisualTabGroup* group) {
+    if (!tab || !group) {
+        return;
+    }
+    tab->visualTabGroupId = group->id;
+}
+
+void ClearVisualTabGroup(WindowTab* tab) {
+    if (!tab) {
+        return;
+    }
+    tab->visualTabGroupId = -1;
+}
+
+COLORREF GetEffectiveTabColor(const VisualTabGroupState& state, const WindowTab* tab) {
+    if (!tab) {
+        return kColorUnset;
+    }
+    if (tab->visualTabGroupId != -1) {
+        VisualTabGroup* group = state.FindGroup(tab->visualTabGroupId);
+        if (group) {
+            return group->color;
+        }
+    }
+    return tab->tabColor;
+}
+
+
+static void ClearVisualTabGroupRef(VisualTabGroupRef& ref) {
+    ref.groupId = -1;
+    str::ReplaceWithCopy(&ref.name, nullptr);
+    str::ReplaceWithCopy(&ref.color, nullptr);
+    ref.collapsed = false;
+}
+
+static void SaveVisualTabGroupRef(const VisualTabGroupState& state, const WindowTab* tab, VisualTabGroupRef& ref) {
+    ClearVisualTabGroupRef(ref);
+    if (!tab || tab->visualTabGroupId == -1) {
+        return;
+    }
+    VisualTabGroup* group = state.FindGroup(tab->visualTabGroupId);
+    if (!group) {
+        return;
+    }
+    ref.groupId = group->id;
+    str::ReplaceWithCopy(&ref.name, group->name);
+    str::ReplaceWithCopy(&ref.color, SerializeColorTemp(group->color));
+    ref.collapsed = group->collapsed;
+}
+
+static VisualTabGroup* EnsureVisualTabGroupFromRef(VisualTabGroupState& state, const VisualTabGroupRef& ref) {
+    if (ref.groupId == -1) {
+        return nullptr;
+    }
+    VisualTabGroup* group = state.FindGroup(ref.groupId);
+    if (!group) {
+        COLORREF color = ParseColor(ref.color, DefaultVisualTabGroupColor(ref.groupId));
+        group = state.CreateGroupWithId(ref.groupId, ref.name, color);
+    }
+    if (!str::IsEmpty(ref.name)) {
+        str::ReplaceWithCopy(&group->name, ref.name);
+    }
+    if (!str::IsEmpty(ref.color)) {
+        group->color = ParseColor(ref.color, group->color);
+    }
+    group->collapsed = ref.collapsed;
+    return group;
+}
+
+void SaveVisualTabGroupToFileState(const VisualTabGroupState& state, const WindowTab* tab, FileState* fs) {
+    if (!fs) {
+        return;
+    }
+    SaveVisualTabGroupRef(state, tab, fs->visualTabGroup);
+}
+
+void SaveVisualTabGroupToTabState(const VisualTabGroupState& state, const WindowTab* tab, TabState* ts) {
+    if (!ts) {
+        return;
+    }
+    SaveVisualTabGroupRef(state, tab, ts->visualTabGroup);
+}
+
+void RestoreVisualTabGroupFromFileState(VisualTabGroupState& state, WindowTab* tab, const FileState* fs) {
+    if (!tab || !fs) {
+        return;
+    }
+    VisualTabGroup* group = EnsureVisualTabGroupFromRef(state, fs->visualTabGroup);
+    if (!group) {
+        ClearVisualTabGroup(tab);
+        return;
+    }
+    SetVisualTabGroup(tab, group);
+}
+
+void RestoreVisualTabGroupFromTabState(VisualTabGroupState& state, WindowTab* tab, const TabState* ts) {
+    if (!tab) {
+        return;
+    }
+    if (!ts) {
+        ClearVisualTabGroup(tab);
+        return;
+    }
+    VisualTabGroup* group = EnsureVisualTabGroupFromRef(state, ts->visualTabGroup);
+    if (!group) {
+        ClearVisualTabGroup(tab);
+        return;
+    }
+    SetVisualTabGroup(tab, group);
+}
+
+void SaveVisualTabGroupsToSessionData(const VisualTabGroupState& state, SessionData* sd) {
+    if (!sd || !sd->visualTabGroups) {
+        return;
+    }
+    DeleteVecMembers(*sd->visualTabGroups);
+    sd->visualTabGroups->Reset();
+    for (VisualTabGroup* group : state.groups) {
+        auto* persisted = new PersistedVisualTabGroup();
+        persisted->id = group->id;
+        str::ReplaceWithCopy(&persisted->name, group->name);
+        str::ReplaceWithCopy(&persisted->color, SerializeColorTemp(group->color));
+        persisted->collapsed = group->collapsed;
+        sd->visualTabGroups->Append(persisted);
+    }
+}
+
+void RestoreVisualTabGroupsFromSessionData(VisualTabGroupState& state, const SessionData* sd) {
+    state.Reset();
+    if (!sd || !sd->visualTabGroups) {
+        return;
+    }
+    for (PersistedVisualTabGroup* persisted : *sd->visualTabGroups) {
+        if (!persisted || persisted->id == -1) {
+            continue;
+        }
+        COLORREF color = ParseColor(persisted->color, DefaultVisualTabGroupColor(persisted->id));
+        VisualTabGroup* group = state.CreateGroupWithId(persisted->id, persisted->name, color);
+        group->collapsed = persisted->collapsed;
+    }
+}
+
+void UpdateVisualTabGroupState(MainWindow* win, WindowTab* tab) {
+    if (!win || !tab || !win->tabsCtrl) {
+        return;
+    }
+    int idx = win->GetTabIdx(tab);
+    if (idx < 0) {
+        return;
+    }
+    TabInfo* ti = win->tabsCtrl->GetTab(idx);
+    if (!ti) {
+        return;
+    }
+    ti->tabColor = GetEffectiveTabColor(win->visualTabGroups, tab);
+    ti->visualTabGroupId = tab->visualTabGroupId;
+    win->tabsCtrl->ScheduleRepaint();
+}
 MainWindow::MainWindow(HWND hwnd) {
     hwndFrame = hwnd;
     linkHandler = new LinkHandler(this);
