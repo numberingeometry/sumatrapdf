@@ -9,6 +9,7 @@
 #include "utils/WinUtil.h"
 #include "utils/StrFormat.h"
 #include "utils/ScopedWin.h"
+#include "utils/SettingsUtil.h"
 
 #include "wingui/UIModels.h"
 
@@ -18,6 +19,8 @@
 #include "GlobalPrefs.h"
 #include "Flags.h"
 #include "Commands.h"
+#include "MainWindow.h"
+#include "WindowTab.h"
 
 #include <float.h>
 #include <math.h>
@@ -203,6 +206,113 @@ static void assertSerializedColor(COLORREF c, const char* s) {
     utassert(str::Eq(s2, s));
 }
 
+static void visualTabGroupsTest() {
+    VisualTabGroupState state;
+
+    VisualTabGroup* g1 = state.CreateDefaultGroup();
+    utassert(g1 != nullptr);
+    utassert(g1->id == 1);
+    utassert(str::Eq(g1->name, "Group 1"));
+    utassert(g1->color == MkColor(213, 90, 90));
+    utassert(!g1->collapsed);
+    utassert(state.FindGroup(g1->id) == g1);
+
+    VisualTabGroup* g2 = state.CreateGroupWithId(7, "Research", MkColor(20, 30, 40));
+    utassert(g2 != nullptr);
+    utassert(g2->id == 7);
+    utassert(g2->name != nullptr);
+    utassert(str::Eq(g2->name, "Research"));
+    utassert(g2->color == MkColor(20, 30, 40));
+    utassert(state.FindGroup(g2->id) == g2);
+
+    state.DeleteGroupById(g1->id);
+    utassert(state.FindGroup(g1->id) == nullptr);
+    utassert(state.FindGroup(g2->id) == g2);
+    utassert(state.nextId == 8);
+}
+
+static void visualTabGroupPersistenceTest() {
+    auto saveRef = [](const VisualTabGroupState& state, int groupId, VisualTabGroupRef& ref) {
+        ref.groupId = -1;
+        str::ReplaceWithCopy(&ref.name, nullptr);
+        str::ReplaceWithCopy(&ref.color, nullptr);
+        ref.collapsed = false;
+        VisualTabGroup* group = state.FindGroup(groupId);
+        if (!group) {
+            return;
+        }
+        ref.groupId = group->id;
+        str::ReplaceWithCopy(&ref.name, group->name);
+        str::ReplaceWithCopy(&ref.color, SerializeColorTemp(group->color));
+        ref.collapsed = group->collapsed;
+    };
+    auto restoreGroup = [](VisualTabGroupState& state, int& groupId, const VisualTabGroupRef& ref) {
+        groupId = -1;
+        if (ref.groupId == -1) {
+            return;
+        }
+        VisualTabGroup* group = state.FindGroup(ref.groupId);
+        if (!group) {
+            group = state.CreateGroupWithId(ref.groupId, ref.name, ParseColor(ref.color, kColorUnset));
+        }
+        if (group) {
+            group->collapsed = ref.collapsed;
+            groupId = group->id;
+        }
+    };
+
+    VisualTabGroupState state;
+    VisualTabGroup* group = state.CreateGroupWithId(7, "Research", MkColor(0x11, 0x22, 0x33));
+    utassert(group != nullptr);
+    group->collapsed = true;
+
+    FileState fs{};
+    TabState ts{};
+    saveRef(state, 7, fs.visualTabGroup);
+    saveRef(state, 7, ts.visualTabGroup);
+
+    state.DeleteGroupById(7);
+    utassert(state.FindGroup(7) == nullptr);
+
+    utassert(fs.visualTabGroup.groupId == 7);
+    utassert(str::Eq(fs.visualTabGroup.name, "Research"));
+    utassert(ParseColor(fs.visualTabGroup.color, kColorUnset) == MkColor(0x11, 0x22, 0x33));
+    utassert(fs.visualTabGroup.collapsed == true);
+
+    utassert(ts.visualTabGroup.groupId == 7);
+    utassert(str::Eq(ts.visualTabGroup.name, "Research"));
+    utassert(ParseColor(ts.visualTabGroup.color, kColorUnset) == MkColor(0x11, 0x22, 0x33));
+    utassert(ts.visualTabGroup.collapsed == true);
+
+    VisualTabGroupState restoredTabState;
+    int restoredTabGroupId = -1;
+    restoreGroup(restoredTabState, restoredTabGroupId, ts.visualTabGroup);
+    utassert(restoredTabGroupId == 7);
+    VisualTabGroup* restoredGroup = restoredTabState.FindGroup(7);
+    utassert(restoredGroup != nullptr);
+    utassert(restoredGroup->id == 7);
+    utassert(str::Eq(restoredGroup->name, "Research"));
+    utassert(restoredGroup->color == MkColor(0x11, 0x22, 0x33));
+    utassert(restoredGroup->collapsed == true);
+
+    VisualTabGroupState restoredFileState;
+    int reopenedTabGroupId = -1;
+    restoreGroup(restoredFileState, reopenedTabGroupId, fs.visualTabGroup);
+    utassert(reopenedTabGroupId == 7);
+    VisualTabGroup* reopenedGroup = restoredFileState.FindGroup(7);
+    utassert(reopenedGroup != nullptr);
+    utassert(reopenedGroup->id == 7);
+    utassert(str::Eq(reopenedGroup->name, "Research"));
+    utassert(reopenedGroup->color == MkColor(0x11, 0x22, 0x33));
+    utassert(reopenedGroup->collapsed == true);
+
+    str::Free(fs.visualTabGroup.name);
+    str::Free(fs.visualTabGroup.color);
+    str::Free(ts.visualTabGroup.name);
+    str::Free(ts.visualTabGroup.color);
+}
+
+
 static void colorTest() {
     COLORREF c = 0;
     bool ok = ParseColor(&c, "0x01020304");
@@ -297,9 +407,23 @@ void parseCommandsTest() {
 
 void SumatraPDF_UnitTests() {
     parseCommandsTest();
+    visualTabGroupsTest();
+    visualTabGroupPersistenceTest();
     colorTest();
     BenchRangeTest();
     ParseCommandLineTest();
     versioncheck_test();
     hexstrTest();
 }
+
+
+
+
+
+
+
+
+
+
+
+
