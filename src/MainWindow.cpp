@@ -111,7 +111,6 @@ COLORREF GetEffectiveTabColor(const VisualTabGroupState& state, const WindowTab*
     return tab->tabColor;
 }
 
-
 static void ClearVisualTabGroupRef(VisualTabGroupRef& ref) {
     ref.groupId = -1;
     str::ReplaceWithCopy(&ref.name, nullptr);

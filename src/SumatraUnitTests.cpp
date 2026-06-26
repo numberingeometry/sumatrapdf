@@ -231,6 +231,23 @@ static void visualTabGroupsTest() {
     utassert(state.nextId == 8);
 }
 
+static void visualTabGroupCollapsedVisibilityTest() {
+    VisualTabGroupState state;
+    VisualTabGroup* group = state.CreateGroupWithId(3, "Research", MkColor(0x33, 0x66, 0x99));
+    utassert(group != nullptr);
+
+    group->collapsed = false;
+    utassert(ShouldShowGroupedTab(state, group->id, false));
+    utassert(ShouldShowGroupedTab(state, group->id, true));
+
+    group->collapsed = true;
+    utassert(!ShouldShowGroupedTab(state, group->id, false));
+    utassert(ShouldShowGroupedTab(state, group->id, true));
+
+    utassert(ShouldShowGroupedTab(state, 99, false));
+    utassert(ShouldShowGroupedTab(state, -1, false));
+}
+
 static void visualTabGroupPersistenceTest() {
     auto saveRef = [](const VisualTabGroupState& state, int groupId, VisualTabGroupRef& ref) {
         ref.groupId = -1;
@@ -408,6 +425,7 @@ void parseCommandsTest() {
 void SumatraPDF_UnitTests() {
     parseCommandsTest();
     visualTabGroupsTest();
+    visualTabGroupCollapsedVisibilityTest();
     visualTabGroupPersistenceTest();
     colorTest();
     BenchRangeTest();

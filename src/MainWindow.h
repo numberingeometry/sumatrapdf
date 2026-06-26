@@ -191,6 +191,19 @@ struct VisualTabGroupState {
 void SetVisualTabGroup(WindowTab* tab, VisualTabGroup* group);
 void ClearVisualTabGroup(WindowTab* tab);
 COLORREF GetEffectiveTabColor(const VisualTabGroupState& state, const WindowTab* tab);
+inline bool ShouldShowGroupedTab(const VisualTabGroupState& state, int groupId, bool isSelectedTab) {
+    if (groupId < 0) {
+        return true;
+    }
+    VisualTabGroup* group = state.FindGroup(groupId);
+    if (!group) {
+        return true;
+    }
+    if (!group->collapsed) {
+        return true;
+    }
+    return isSelectedTab;
+}
 void SaveVisualTabGroupToFileState(const VisualTabGroupState& state, const WindowTab* tab, FileState* fs);
 void SaveVisualTabGroupToTabState(const VisualTabGroupState& state, const WindowTab* tab, TabState* ts);
 void RestoreVisualTabGroupFromFileState(VisualTabGroupState& state, WindowTab* tab, const FileState* fs);
