@@ -2270,6 +2270,8 @@ ContinueOpenWindow:
                 // trigger loading of the document
                 ReloadDocument(win, false);
             }
+            // tabs + selection are restored; collapse any groups persisted as collapsed
+            ApplyVisualTabGroupCollapse(win);
             ShowMainWindow(win, data->windowState);
         }
     }

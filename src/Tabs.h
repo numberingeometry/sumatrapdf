@@ -21,3 +21,7 @@ void CollectTabsToClose(MainWindow* win, WindowTab* currTab, Vec<WindowTab*>& to
                         Vec<WindowTab*>& toCloseRight, Vec<WindowTab*>& toCloseLeft);
 void CloseAllTabs(MainWindow*);
 void MoveTab(MainWindow* win, int dir);
+// syncs each tab's collapse-hidden flag from its visual group's collapsed state, then re-lays out
+void ApplyVisualTabGroupCollapse(MainWindow* win);
+// if `tab` is in a group, moves it next to that group's other members so the group stays contiguous
+void EnsureVisualTabGroupContiguity(MainWindow* win, WindowTab* tab);

@@ -1553,6 +1553,9 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         if (fs == gFileHistory.FindByPath(path)) {
             RestoreVisualTabGroupFromFileState(win->visualTabGroups, tab, fs);
             UpdateVisualTabGroupState(win, tab);
+            // do this before the document renders so a reopened/just-opened tab that
+            // restored into an existing group snaps into place without a visible split
+            EnsureVisualTabGroupContiguity(win, tab);
         }
     }
 

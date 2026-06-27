@@ -152,8 +152,44 @@ static void UpdateTabVisualGroupState(MainWindow* win, WindowTab* tab) {
     if (!ti) {
         return;
     }
-    ti->tabColor = GetEffectiveTabColor(win->visualTabGroups, tab);
+    // grouped tabs are NOT tinted; membership is shown by the chip + underline.
+    // keep the tab's own (manual) color, if any.
+    ti->tabColor = tab->tabColor;
     ti->visualTabGroupId = tab->visualTabGroupId;
+}
+
+// keep a group's tabs contiguous: if `tab` joined a group whose other members live
+// elsewhere in the tab strip (e.g. a reopened closed tab appended at the end), move it
+// next to them so the layout draws one chip, not a split group.
+void EnsureVisualTabGroupContiguity(MainWindow* win, WindowTab* tab) {
+    if (!win || !tab || !win->tabsCtrl) {
+        return;
+    }
+    int groupId = tab->visualTabGroupId;
+    if (groupId == -1) {
+        return;
+    }
+    int cur = win->GetTabIdx(tab);
+    if (cur < 0) {
+        return;
+    }
+    int n = win->TabCount();
+    int anchor = -1; // last index (other than `tab`) that belongs to the same group
+    for (int i = 0; i < n; i++) {
+        if (i == cur) {
+            continue;
+        }
+        if (win->GetTab(i)->visualTabGroupId == groupId) {
+            anchor = i;
+        }
+    }
+    if (anchor < 0) {
+        return; // only member; nothing to gather
+    }
+    if (cur == anchor + 1) {
+        return; // already directly after the group's run
+    }
+    win->tabsCtrl->MoveTabToIndex(cur, anchor + 1);
 }
 
 static void AssignTabToVisualGroup(MainWindow* win, WindowTab* tab, VisualTabGroup* group) {
@@ -164,6 +200,9 @@ static void AssignTabToVisualGroup(MainWindow* win, WindowTab* tab, VisualTabGro
     SetVisualTabGroup(tab, group);
     UpdateTabVisualGroupState(win, tab);
     DeleteVisualTabGroupIfEmpty(win, oldGroupId);
+    // LayoutTabs() rebuilds the group header bands (fills groupHeaders); without it
+    // the membership change repaints with a stale (empty) header list and no band shows
+    win->tabsCtrl->LayoutTabs();
     win->tabsCtrl->ScheduleRepaint();
 }
 
@@ -175,7 +214,35 @@ static void RemoveTabFromVisualGroup(MainWindow* win, WindowTab* tab) {
     ClearVisualTabGroup(tab);
     UpdateTabVisualGroupState(win, tab);
     DeleteVisualTabGroupIfEmpty(win, oldGroupId);
+    // LayoutTabs() rebuilds the group header bands (fills groupHeaders); without it
+    // the membership change repaints with a stale header list
+    win->tabsCtrl->LayoutTabs();
     win->tabsCtrl->ScheduleRepaint();
+}
+
+// Sync each tab-bar item's collapse-hidden flag from its group's collapsed
+// state, then re-layout. A collapsed group hides all its tabs except the
+// selected one (so the active document stays reachable), matching
+// ShouldShowGroupedTab().
+void ApplyVisualTabGroupCollapse(MainWindow* win) {
+    if (!win || !win->tabsCtrl) {
+        return;
+    }
+    TabsCtrl* tabsCtrl = win->tabsCtrl;
+    int selectedIdx = tabsCtrl->GetSelected();
+    int nTabs = tabsCtrl->TabCount();
+    for (int i = 0; i < nTabs; i++) {
+        TabInfo* ti = tabsCtrl->GetTab(i);
+        if (!ti) {
+            continue;
+        }
+        bool isSelected = (i == selectedIdx);
+        bool show = ShouldShowGroupedTab(win->visualTabGroups, ti->visualTabGroupId, isSelected);
+        ti->isHiddenByGroupCollapse = !show;
+    }
+    tabsCtrl->StartTabAnimation(); // slide tabs as the group collapses/expands
+    tabsCtrl->LayoutTabs();
+    tabsCtrl->ScheduleRepaint();
 }
 
 static VisualTabGroup* GetVisualTabGroupForMenuCmd(MainWindow* win, WindowTab* currentTab, UINT_PTR cmdId) {
@@ -210,7 +277,8 @@ static void AddVisualTabGroupMenuItems(HMENU popup, MainWindow* win, WindowTab* 
         if (group->id == tabUnderMouse->visualTabGroupId) {
             continue;
         }
-        AppendMenuW(addToGroup, MF_STRING | MF_ENABLED, CmdAddToVisualTabGroupBase + menuIdx, ToWStrTemp(group->name));
+        const char* gname = str::IsEmpty(group->name) ? str::FormatTemp("Group %d", group->id) : group->name;
+        AppendMenuW(addToGroup, MF_STRING | MF_ENABLED, CmdAddToVisualTabGroupBase + menuIdx, ToWStrTemp(gname));
         menuIdx++;
         hasGroups = true;
     }
@@ -732,6 +800,95 @@ static void MainWindowTabMigration(MainWindow* win, TabsCtrl::MigrationEvent* ev
     MaybeMigrateTab(tab, releaseWnd, ev->releasePoint);
 }
 
+// when collapsing a group that holds the active tab, pick a tab to switch to:
+// nearest ungrouped tab to the right, then to the left, else any tab outside the group.
+static int FindTabToSelectOnCollapse(MainWindow* win, int groupId) {
+    int n = win->TabCount();
+    int sel = win->tabsCtrl->GetSelected();
+    for (int i = sel + 1; i < n; i++) {
+        if (win->GetTab(i)->visualTabGroupId == -1) {
+            return i;
+        }
+    }
+    for (int i = sel - 1; i >= 0; i--) {
+        if (win->GetTab(i)->visualTabGroupId == -1) {
+            return i;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (win->GetTab(i)->visualTabGroupId != groupId) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// clicking a group header (or its caret) toggles the group's collapsed state
+static void MainWindowGroupHeaderClick(MainWindow* win, TabsCtrl::GroupHeaderClickEvent* ev) {
+    if (!win || !ev) {
+        return;
+    }
+    VisualTabGroup* group = win->visualTabGroups.FindGroup(ev->groupId);
+    if (!group) {
+        return;
+    }
+    bool willCollapse = !group->collapsed;
+    if (willCollapse) {
+        // Chrome-style: a collapsed group hides ALL its tabs, so if the active tab is
+        // inside it, switch to another tab first (otherwise the selection would be hidden).
+        WindowTab* cur = win->CurrentTab();
+        if (cur && cur->visualTabGroupId == group->id) {
+            int idx = FindTabToSelectOnCollapse(win, group->id);
+            if (idx < 0) {
+                // nowhere else to go (every tab is in this group): leave it expanded
+                return;
+            }
+            TabsSelect(win, idx);
+        }
+    }
+    group->collapsed = willCollapse;
+    // freeze tab widths so the clicked header chip stays put under the cursor (like Chrome);
+    // the freeze auto-clears when the mouse leaves the tab bar (see TabsCtrl WM_MOUSELEAVE)
+    TabsCtrl* tc = win->tabsCtrl;
+    if (tc && tc->tabSize.dx > 0) {
+        tc->frozenTabDx = tc->tabSize.dx;
+        tc->tabWidthFrozen = true;
+    }
+    ApplyVisualTabGroupCollapse(win);
+}
+
+// a tab was dropped onto a group (groupId >= 0) or out of any group (groupId == -1)
+static void MainWindowTabGroupDrop(MainWindow* win, TabsCtrl::GroupDropEvent* ev) {
+    if (!win || !ev) {
+        return;
+    }
+    WindowTab* tab = win->GetTab(ev->tabIdx);
+    if (!tab) {
+        return;
+    }
+    int curGroup = tab->visualTabGroupId;
+    if (ev->groupId < 0) {
+        if (curGroup != -1) {
+            RemoveTabFromVisualGroup(win, tab); // re-syncs the bar item + re-lays out
+            return;
+        }
+    } else if (curGroup != ev->groupId) {
+        VisualTabGroup* group = win->visualTabGroups.FindGroup(ev->groupId);
+        if (group) {
+            AssignTabToVisualGroup(win, tab, group); // re-syncs + re-lays out
+            if (group->collapsed) {
+                ApplyVisualTabGroupCollapse(win);
+            }
+            return;
+        }
+    }
+    // membership didn't change: a live in-strip drag may have left a stale visual group on
+    // the tab-bar item, so re-sync it from the model and re-lay out
+    UpdateTabVisualGroupState(win, tab);
+    win->tabsCtrl->LayoutTabs();
+    win->tabsCtrl->ScheduleRepaint();
+}
+
 void CreateTabbar(MainWindow* win) {
     TabsCtrl::CreateArgs args;
     args.parent = win->hwndFrame;
@@ -747,6 +904,8 @@ void CreateTabbar(MainWindow* win) {
     tabsCtrl->onSelectionChanged = MkFunc1(MainWindowTabSelectionChanged, win);
     tabsCtrl->onContextMenu = MkFunc1Void(TabsContextMenu);
     tabsCtrl->onTabMigration = MkFunc1(MainWindowTabMigration, win);
+    tabsCtrl->onGroupHeaderClick = MkFunc1(MainWindowGroupHeaderClick, win);
+    tabsCtrl->onTabGroupDrop = MkFunc1(MainWindowTabGroupDrop, win);
     tabsCtrl->Create(args);
     win->tabsCtrl = tabsCtrl;
     win->tabSelectionHistory = new Vec<WindowTab*>();

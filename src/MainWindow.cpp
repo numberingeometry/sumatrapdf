@@ -237,7 +237,9 @@ void UpdateVisualTabGroupState(MainWindow* win, WindowTab* tab) {
     if (!ti) {
         return;
     }
-    ti->tabColor = GetEffectiveTabColor(win->visualTabGroups, tab);
+    // grouped tabs are NOT tinted; membership is shown by the chip + underline.
+    // keep the tab's own (manual) color, if any.
+    ti->tabColor = tab->tabColor;
     ti->visualTabGroupId = tab->visualTabGroupId;
     win->tabsCtrl->ScheduleRepaint();
 }

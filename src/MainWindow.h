@@ -162,8 +162,9 @@ struct VisualTabGroupState {
 
     VisualTabGroup* CreateDefaultGroup() {
         int id = nextId;
-        TempStr name = str::FormatTemp("Group %d", id);
-        return CreateGroupWithId(id, name, DefaultVisualTabGroupColor(id));
+        // default groups have no label (the chip is just a colored pill + caret);
+        // the user can name them later
+        return CreateGroupWithId(id, "", DefaultVisualTabGroupColor(id));
     }
 
     VisualTabGroup* FindGroup(int id) const {
