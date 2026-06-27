@@ -688,6 +688,7 @@ struct TabInfo {
     bool isPinned = false;
     bool canClose = true; // TODO: same as !isPinned?
     bool isDirty = false;
+    bool isHiddenByGroupCollapse = false;
     UINT_PTR userData = 0;
     COLORREF tabColor = (COLORREF)(0xfeffffff); // kColorUnset; use default tab color
     int visualTabGroupId = -1;
@@ -697,10 +698,17 @@ struct TabInfo {
 
     // for internal use
     Rect r;
+    Rect rVisible;
     Rect rClose;    // visual close button
     Rect rCloseHit; // expanded hit test area for close
     Size titleSize;
     Point titlePos;
+
+    // tab-position animation: animX is the current (animated) left, persisted across layouts;
+    // targetX is the slot it eases toward. animInit guards the first layout so it snaps.
+    int animX = 0;
+    int targetX = 0;
+    bool animInit = false;
 };
 
 struct TabsCtrl : Wnd {
@@ -719,7 +727,18 @@ struct TabsCtrl : Wnd {
         // if true, mouse is over right half of the tab rectangle
         // used to make drag&drop determine a better position for drop
         bool inRightHalf = false;
+        bool overGroupHeader = false;
+        bool overGroupCaret = false;
+        int groupId = -1;
         TabInfo* tabInfo = nullptr;
+    };
+
+    struct GroupHeaderInfo {
+        int groupId = -1;
+        const char* label = nullptr;
+        Rect rHeader{};
+        Rect rCaret{};
+        Rect rTabs{};
     };
 
     struct SelectionChangingEvent {
@@ -751,20 +770,41 @@ struct TabsCtrl : Wnd {
         int tab2 = -1;
     };
 
+    struct GroupHeaderClickEvent {
+        TabsCtrl* tabs = nullptr;
+        int groupId = -1;
+    };
+
+    // a tab was dropped onto a group (groupId >= 0) or out of any group (groupId == -1)
+    struct GroupDropEvent {
+        TabsCtrl* tabs = nullptr;
+        int tabIdx = -1;
+        int groupId = -1;
+    };
+
     using SelectionChangingHandler = Func1<SelectionChangingEvent*>;
     using SelectionChangedHandler = Func1<SelectionChangedEvent*>;
     using ClosedHandler = Func1<ClosedEvent*>;
     using MigrationHandler = Func1<MigrationEvent*>;
     using DraggedHandler = Func1<DraggedEvent*>;
+    using GroupHeaderClickHandler = Func1<GroupHeaderClickEvent*>;
+    using GroupDropHandler = Func1<GroupDropEvent*>;
 
     int ctrlID = 0;
     bool withToolTips = false;
     bool inTitleBar = false;
     bool draggingTab = false;
+    // true while a drag has been pulled out of the tab strip (floating image / tear-off)
+    bool dragDetached = false;
+    // cursor x (client coords) during an in-strip drag; the dragged tab follows it
+    int dragMouseX = 0;
+    // true while tabs are easing toward their slots (drag swap-slide / collapse-expand)
+    bool tabsAnimating = false;
     // dx of tab if there's more space available
     int tabDefaultDx = 300;
 
     Vec<TabInfo*> tabs;
+    Vec<GroupHeaderInfo> groupHeaders;
 
     // tracking state of which tab is highlighted etc.
     int tabHighlighted = -1;
@@ -786,6 +826,8 @@ struct TabsCtrl : Wnd {
     SelectionChangedHandler onSelectionChanged;
     MigrationHandler onTabMigration;
     DraggedHandler onTabDragged;
+    GroupHeaderClickHandler onGroupHeaderClick;
+    GroupDropHandler onTabGroupDrop;
 
     COLORREF currBgCol = 0;
     COLORREF tabBackgroundBg = 0;
@@ -820,6 +862,14 @@ struct TabsCtrl : Wnd {
     int InsertTab(int idx, TabInfo*);
     TabInfo* GetTab(int idx);
     void SwapTabs(int idx1, int idx2);
+    // moves the tab at `from` so it ends up just before index `to` (pre-removal numbering)
+    void MoveTabToIndex(int from, int to);
+    // live reorder during an in-strip drag (does not release capture / end the drag)
+    void ReorderDuringDrag(int from, int to);
+    // start easing tabs toward their slots (call before LayoutTabs to animate the change)
+    void StartTabAnimation();
+    // advance the tab-slide animation one frame; returns true while tabs are still moving
+    bool AnimateTick();
 
     void SetTextAndTooltip(int idx, const char* text, const char* tooltip);
     void SetTabDirty(int idx, bool isDirty);
@@ -886,3 +936,4 @@ struct DrawCloseButtonArgs {
 
 void DrawCloseButton(const DrawCloseButtonArgs& args);
 void DrawCloseButton2(const DrawCloseButtonArgs&);
+
