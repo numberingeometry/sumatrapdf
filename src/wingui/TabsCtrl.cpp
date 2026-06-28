@@ -1404,11 +1404,24 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     continue;
                 }
                 TabInfo* t = GetTab(i);
+                int center;
                 if (t->rVisible.IsEmpty()) {
-                    continue;
+                    // a hidden tab is a collapsed group's member — treat the whole collapsed group
+                    // as one unit positioned at its chip, so the dragged tab passes the group as a
+                    // block instead of landing among the hidden members (which wedged it inside the
+                    // group with no way to reorder back out)
+                    center = t->targetX;
+                    for (auto& gh : groupHeaders) {
+                        if (gh.groupId == t->visualTabGroupId) {
+                            center = gh.rHeader.x + gh.rHeader.dx / 2;
+                            break;
+                        }
+                    }
+                } else {
+                    // compare against the slot (targetX), not the mid-animation position
+                    center = t->targetX + t->rVisible.dx / 2;
                 }
-                // compare against the slot (targetX), not the mid-animation position
-                if (floatCenter > t->targetX + t->rVisible.dx / 2) {
+                if (floatCenter > center) {
                     target++;
                 }
             }
@@ -1429,6 +1442,15 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int nTabsNow = TabCount();
             int leftG = (from - 1 >= 0) ? GetTab(from - 1)->visualTabGroupId : -1;
             int rightG = (from + 1 < nTabsNow) ? GetTab(from + 1)->visualTabGroupId : -1;
+            // a hidden neighbour belongs to a COLLAPSED group: treat that side as no group, so a
+            // tab-drag passes a collapsed group as a unit instead of joining it (and getting
+            // wedged among its hidden members, unable to leave to the right)
+            if (from - 1 >= 0 && GetTab(from - 1)->rVisible.IsEmpty()) {
+                leftG = -1;
+            }
+            if (from + 1 < nTabsNow && GetTab(from + 1)->rVisible.IsEmpty()) {
+                rightG = -1;
+            }
             int newG = -1;
             if (leftG != -1 && leftG == rightG) {
                 newG = leftG; // strictly inside a group's run
