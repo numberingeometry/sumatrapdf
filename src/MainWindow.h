@@ -103,18 +103,30 @@ struct StaticLink {
     ~StaticLink();
 };
 
-static inline COLORREF DefaultVisualTabGroupColor(int id) {
+// Chrome-style group color palette. Shared by the default-color assignment and the
+// group editor's color swatches, so a group's color always lines up with a swatch.
+static inline const COLORREF* VisualTabGroupPalette(int* nColorsOut) {
     static COLORREF colors[] = {
-        MkColor(213, 90, 90),
-        MkColor(219, 144, 65),
-        MkColor(201, 176, 59),
-        MkColor(94, 166, 91),
-        MkColor(81, 151, 214),
-        MkColor(137, 115, 210),
+        MkColor(128, 134, 139), // grey
+        MkColor(213, 90, 90),   // red
+        MkColor(219, 144, 65),  // orange
+        MkColor(201, 176, 59),  // yellow
+        MkColor(94, 166, 91),   // green
+        MkColor(76, 182, 184),  // cyan
+        MkColor(81, 151, 214),  // blue
+        MkColor(137, 115, 210), // purple
     };
-    int nColors = dimof(colors);
+    if (nColorsOut) {
+        *nColorsOut = (int)dimof(colors);
+    }
+    return colors;
+}
+
+static inline COLORREF DefaultVisualTabGroupColor(int id) {
+    int nColors = 0;
+    const COLORREF* colors = VisualTabGroupPalette(&nColors);
     if (id <= 0 || nColors == 0) {
-        return MkColor(213, 90, 90);
+        return colors[0];
     }
     return colors[(id - 1) % nColors];
 }

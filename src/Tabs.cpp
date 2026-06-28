@@ -115,6 +115,11 @@ void UpdateTabWidth(MainWindow* win) {
 
 constexpr UINT_PTR CmdCreateVisualTabGroup = 50000;
 constexpr UINT_PTR CmdRemoveVisualTabGroup = 50001;
+constexpr UINT_PTR CmdRenameVisualTabGroup = 50002;
+constexpr UINT_PTR CmdRecolorVisualTabGroup = 50003;
+constexpr UINT_PTR CmdToggleVisualTabGroupCollapse = 50004;
+constexpr UINT_PTR CmdCloseVisualTabGroup = 50005;
+constexpr UINT_PTR CmdDisbandVisualTabGroup = 50006;
 constexpr UINT_PTR CmdAddToVisualTabGroupBase = 50100;
 
 static void DeleteVisualTabGroupIfEmpty(MainWindow* win, int groupId) {
@@ -267,7 +272,9 @@ static void AddVisualTabGroupMenuItems(HMENU popup, MainWindow* win, WindowTab* 
     UINT flags = MF_BYCOMMAND | MF_STRING | MF_ENABLED;
     InsertMenuW(popup, CmdSetTabColor, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
     if (tabUnderMouse->visualTabGroupId != -1) {
-        InsertMenuW(popup, CmdSetTabColor, flags, CmdRemoveVisualTabGroup, ToWStrTemp(_TRN("Ungroup")));
+        InsertMenuW(popup, CmdSetTabColor, flags, CmdRemoveVisualTabGroup, ToWStrTemp(_TRN("Remove from Group")));
+        InsertMenuW(popup, CmdSetTabColor, flags, CmdRenameVisualTabGroup, ToWStrTemp(_TRN("Rename Tab Group")));
+        InsertMenuW(popup, CmdSetTabColor, flags, CmdRecolorVisualTabGroup, ToWStrTemp(_TRN("Set Group Color")));
     }
 
     HMENU addToGroup = CreatePopupMenu();
@@ -592,10 +599,515 @@ void CloseAllTabs(MainWindow* win) {
 }
 
 // TODO: add "Move to another window" sub-menu
+// prompts for a new name and applies it to the group (empty clears the name)
+static void RenameVisualTabGroupInteractive(MainWindow* win, VisualTabGroup* group) {
+    if (!win || !group) {
+        return;
+    }
+    char* newName = Dialog_RenameTabGroup(win->hwndFrame, group->name);
+    if (!newName) {
+        return; // cancelled
+    }
+    str::ReplaceWithCopy(&group->name, newName);
+    str::Free(newName);
+    // the chip width depends on the label, so re-layout before repainting
+    win->tabsCtrl->LayoutTabs();
+    win->tabsCtrl->ScheduleRepaint();
+    SaveSettings();
+}
+
+// prompts for a new color and applies it to the group
+static void RecolorVisualTabGroupInteractive(MainWindow* win, VisualTabGroup* group) {
+    if (!win || !group) {
+        return;
+    }
+    COLORREF newColor;
+    if (!Dialog_SetGroupColor(win->hwndFrame, group->color, newColor)) {
+        return; // cancelled
+    }
+    group->color = newColor;
+    win->tabsCtrl->LayoutTabs();
+    win->tabsCtrl->ScheduleRepaint();
+    SaveSettings();
+}
+
+// disbands the group: every member leaves the group (tabs stay open)
+static void DisbandVisualTabGroup(MainWindow* win, int groupId) {
+    if (!win || groupId < 0) {
+        return;
+    }
+    Vec<WindowTab*> members;
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab->visualTabGroupId == groupId) {
+            members.Append(tab);
+        }
+    }
+    // RemoveTabFromVisualGroup re-layouts and deletes the group once the last member leaves
+    for (WindowTab* tab : members) {
+        RemoveTabFromVisualGroup(win, tab);
+    }
+    SaveSettings();
+}
+
+// closes every tab in the group
+static void CloseVisualTabGroup(MainWindow* win, int groupId) {
+    if (!win || groupId < 0) {
+        return;
+    }
+    Vec<WindowTab*> members;
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab->visualTabGroupId == groupId) {
+            members.Append(tab);
+        }
+    }
+    for (WindowTab* tab : members) {
+        CloseTab(tab, false);
+    }
+}
+
+// ===== Chrome-style visual tab group editor popup =====
+// A frameless popup shown when a group's header band is right-clicked: a name edit box, a
+// row of color swatches, and the group actions (collapse/expand, ungroup, close). Mirrors
+// Chrome's tab-group editor. Built with plain GDI; dismisses on focus loss / Esc / Enter.
+
+static const WCHAR* kGroupEditorClass = L"SumatraVisualTabGroupEditor";
+
+enum {
+    kGroupActCollapse = 0,
+    kGroupActUngroup,
+    kGroupActClose,
+    kGroupActCount,
+};
+
+struct VisualTabGroupEditor {
+    MainWindow* win = nullptr;
+    int groupId = -1;
+    HWND hwnd = nullptr;
+    HWND hwndEdit = nullptr;
+    WNDPROC editOrigProc = nullptr;
+    HFONT font = nullptr;
+    HBRUSH editBgBrush = nullptr;
+    COLORREF bgCol = 0;
+    COLORREF fgCol = 0;
+    COLORREF editBgCol = 0;
+    COLORREF hoverCol = 0;
+    int hotSwatch = -1;
+    int hotAction = -1;
+    bool committed = false;
+    bool destroying = false;
+    // layout (client coords), filled by LayoutGroupEditor
+    RECT rEdit{};
+    RECT rSwatch[16]{};
+    int nSwatch = 0;
+    RECT rAction[kGroupActCount]{};
+    int sepY = 0;
+    int pad = 0;
+    int swatchDiam = 0;
+};
+
+static COLORREF BlendCol(COLORREF a, COLORREF b, int pct) {
+    int r = (GetRValue(a) * (100 - pct) + GetRValue(b) * pct) / 100;
+    int g = (GetGValue(a) * (100 - pct) + GetGValue(b) * pct) / 100;
+    int bl = (GetBValue(a) * (100 - pct) + GetBValue(b) * pct) / 100;
+    return RGB(r, g, bl);
+}
+
+static COLORREF ContrastTextCol(COLORREF bg) {
+    int lum = (GetRValue(bg) * 299 + GetGValue(bg) * 587 + GetBValue(bg) * 114) / 1000;
+    return lum < 128 ? RGB(0xf0, 0xf0, 0xf0) : RGB(0x20, 0x20, 0x20);
+}
+
+static const char* GroupEditorActionLabel(VisualTabGroup* group, int act) {
+    switch (act) {
+        case kGroupActCollapse:
+            return group && group->collapsed ? _TRA("Expand group") : _TRA("Collapse group");
+        case kGroupActUngroup:
+            return _TRA("Ungroup");
+        case kGroupActClose:
+            return _TRA("Close group");
+    }
+    return "";
+}
+
+static void LayoutGroupEditor(VisualTabGroupEditor* ed) {
+    HWND hwnd = ed->hwnd;
+    int pad = DpiScale(hwnd, 12);
+    int editH = DpiScale(hwnd, 26);
+    int sd = DpiScale(hwnd, 20);
+    int sgap = DpiScale(hwnd, 9);
+    int rowH = DpiScale(hwnd, 32);
+    ed->pad = pad;
+    ed->swatchDiam = sd;
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left;
+
+    int y = pad;
+    ed->rEdit = RECT{pad, y, w - pad, y + editH};
+    y += editH + pad;
+
+    int sx = pad;
+    for (int i = 0; i < ed->nSwatch; i++) {
+        ed->rSwatch[i] = RECT{sx, y, sx + sd, y + sd};
+        sx += sd + sgap;
+    }
+    y += sd + pad;
+
+    ed->sepY = y - pad / 2;
+    for (int i = 0; i < kGroupActCount; i++) {
+        ed->rAction[i] = RECT{0, y, w, y + rowH};
+        y += rowH;
+    }
+}
+
+static void CommitGroupEditorName(VisualTabGroupEditor* ed) {
+    if (ed->committed) {
+        return;
+    }
+    ed->committed = true;
+    VisualTabGroup* group = ed->win->visualTabGroups.FindGroup(ed->groupId);
+    if (!group) {
+        return; // group was disbanded/closed by an action
+    }
+    TempStr entered = HwndGetTextTemp(ed->hwndEdit);
+    if (!str::Eq(entered ? entered : "", group->name ? group->name : "")) {
+        str::ReplaceWithCopy(&group->name, entered ? entered : "");
+        ed->win->tabsCtrl->LayoutTabs();
+        ed->win->tabsCtrl->ScheduleRepaint();
+    }
+    SaveSettings();
+}
+
+static void PaintGroupEditor(VisualTabGroupEditor* ed, HDC hdc) {
+    HWND hwnd = ed->hwnd;
+    VisualTabGroup* group = ed->win->visualTabGroups.FindGroup(ed->groupId);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+
+    // background, separator, hovered-row highlight and action text (plain GDI)
+    HBRUSH bgBr = CreateSolidBrush(ed->bgCol);
+    FillRect(hdc, &rc, bgBr);
+    DeleteObject(bgBr);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, BlendCol(ed->bgCol, ed->fgCol, 25));
+    HGDIOBJ op = SelectObject(hdc, sepPen);
+    MoveToEx(hdc, ed->pad, ed->sepY, nullptr);
+    LineTo(hdc, rc.right - ed->pad, ed->sepY);
+    SelectObject(hdc, op);
+    DeleteObject(sepPen);
+
+    HGDIOBJ of = SelectObject(hdc, ed->font);
+    SetBkMode(hdc, TRANSPARENT);
+    for (int i = 0; i < kGroupActCount; i++) {
+        RECT r = ed->rAction[i];
+        if (ed->hotAction == i) {
+            HBRUSH hb = CreateSolidBrush(ed->hoverCol);
+            FillRect(hdc, &r, hb);
+            DeleteObject(hb);
+        }
+        SetTextColor(hdc, ed->fgCol);
+        RECT rt = r;
+        rt.left += ed->pad;
+        TempWStr ws = ToWStrTemp(GroupEditorActionLabel(group, i));
+        DrawTextW(hdc, ws, -1, &rt, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    }
+    SelectObject(hdc, of);
+
+    // color swatches via GDI+ so the circles are smooth (anti-aliased), like Chrome
+    int n = 0;
+    const COLORREF* palette = VisualTabGroupPalette(&n);
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    for (int i = 0; i < ed->nSwatch && i < n; i++) {
+        RECT r = ed->rSwatch[i];
+        int d = r.right - r.left;
+        bool selected = group && (palette[i] == group->color);
+        bool hot = (ed->hotSwatch == i);
+        int inset = (selected || hot) ? DpiScale(hwnd, 3) : 0;
+        if (selected || hot) {
+            // outer ring with a gap, then the color disc inset inside it
+            Gdiplus::Pen pen(Gdiplus::Color(GetRValue(ed->fgCol), GetGValue(ed->fgCol), GetBValue(ed->fgCol)),
+                             (Gdiplus::REAL)DpiScale(hwnd, 2));
+            g.DrawEllipse(&pen, r.left, r.top, d - 1, d - 1);
+        }
+        Gdiplus::SolidBrush br(Gdiplus::Color(GetRValue(palette[i]), GetGValue(palette[i]), GetBValue(palette[i])));
+        g.FillEllipse(&br, r.left + inset, r.top + inset, d - 2 * inset, d - 2 * inset);
+    }
+}
+
+static int GroupEditorSwatchAt(VisualTabGroupEditor* ed, POINT pt) {
+    for (int i = 0; i < ed->nSwatch; i++) {
+        if (PtInRect(&ed->rSwatch[i], pt)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int GroupEditorActionAt(VisualTabGroupEditor* ed, POINT pt) {
+    for (int i = 0; i < kGroupActCount; i++) {
+        if (PtInRect(&ed->rAction[i], pt)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void GroupEditorApplyColor(VisualTabGroupEditor* ed, int swatchIdx) {
+    int n = 0;
+    const COLORREF* palette = VisualTabGroupPalette(&n);
+    if (swatchIdx < 0 || swatchIdx >= n) {
+        return;
+    }
+    VisualTabGroup* group = ed->win->visualTabGroups.FindGroup(ed->groupId);
+    if (!group) {
+        return;
+    }
+    group->color = palette[swatchIdx];
+    // live preview: the chip + underline pick up the new color immediately
+    ed->win->tabsCtrl->LayoutTabs();
+    ed->win->tabsCtrl->ScheduleRepaint();
+    InvalidateRect(ed->hwnd, nullptr, FALSE);
+}
+
+static void GroupEditorRunAction(VisualTabGroupEditor* ed, int act) {
+    MainWindow* win = ed->win;
+    int groupId = ed->groupId;
+    CommitGroupEditorName(ed); // keep any name edit before acting
+    ed->destroying = true;     // suppress the re-entrant WM_ACTIVATE destroy
+    DestroyWindow(ed->hwnd);   // ed is freed in WM_NCDESTROY; don't touch it after this
+    VisualTabGroup* group = win->visualTabGroups.FindGroup(groupId);
+    switch (act) {
+        case kGroupActCollapse:
+            if (group) {
+                group->collapsed = !group->collapsed;
+                ApplyVisualTabGroupCollapse(win);
+                SaveSettings();
+            }
+            return;
+        case kGroupActUngroup:
+            DisbandVisualTabGroup(win, groupId);
+            return;
+        case kGroupActClose:
+            CloseVisualTabGroup(win, groupId);
+            return;
+    }
+}
+
+static LRESULT CALLBACK GroupEditorEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* ed = (VisualTabGroupEditor*)GetWindowLongPtr(GetParent(hwnd), GWLP_USERDATA);
+    if (ed && msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+        ed->destroying = true;
+        DestroyWindow(ed->hwnd);
+        return 0;
+    }
+    if (ed && msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+        return 0; // swallow so the edit doesn't beep
+    }
+    WNDPROC orig = ed ? ed->editOrigProc : nullptr;
+    return orig ? CallWindowProc(orig, hwnd, msg, wp, lp) : DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK VisualTabGroupEditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* ed = (VisualTabGroupEditor*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (!ed && msg != WM_CREATE) {
+        return DefWindowProc(hwnd, msg, wp, lp);
+    }
+    switch (msg) {
+        case WM_CREATE: {
+            auto* cs = (CREATESTRUCT*)lp;
+            ed = (VisualTabGroupEditor*)cs->lpCreateParams;
+            ed->hwnd = hwnd;
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)ed);
+
+            // rounded popup corners for a softer, Chrome-like panel
+            int rad = DpiScale(hwnd, 8);
+            HRGN rgn = CreateRoundRectRgn(0, 0, cs->cx + 1, cs->cy + 1, rad, rad);
+            SetWindowRgn(hwnd, rgn, TRUE); // window owns the region now
+
+            ed->bgCol = ThemeControlBackgroundColor();
+            ed->fgCol = ContrastTextCol(ed->bgCol);
+            ed->editBgCol = BlendCol(ed->bgCol, ed->fgCol, 10);
+            ed->hoverCol = BlendCol(ed->bgCol, ed->fgCol, 14);
+            ed->editBgBrush = CreateSolidBrush(ed->editBgCol);
+            int fh = -DpiScale(hwnd, 13);
+            ed->font = CreateFontW(fh, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+            LayoutGroupEditor(ed);
+            RECT re = ed->rEdit;
+            ed->hwndEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, re.left, re.top,
+                                           re.right - re.left, re.bottom - re.top, hwnd, (HMENU)1,
+                                           (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), nullptr);
+            SendMessageW(ed->hwndEdit, WM_SETFONT, (WPARAM)ed->font, TRUE);
+            VisualTabGroup* group = ed->win->visualTabGroups.FindGroup(ed->groupId);
+            if (group && group->name) {
+                HwndSetText(ed->hwndEdit, group->name);
+            }
+            ed->editOrigProc = (WNDPROC)SetWindowLongPtr(ed->hwndEdit, GWLP_WNDPROC, (LONG_PTR)GroupEditorEditProc);
+            return 0;
+        }
+        case WM_CTLCOLOREDIT: {
+            HDC dc = (HDC)wp;
+            SetTextColor(dc, ed->fgCol);
+            SetBkColor(dc, ed->editBgCol);
+            return (LRESULT)ed->editBgBrush;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            PaintGroupEditor(ed, hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
+            int hs = GroupEditorSwatchAt(ed, pt);
+            int ha = (hs < 0) ? GroupEditorActionAt(ed, pt) : -1;
+            if (hs != ed->hotSwatch || ha != ed->hotAction) {
+                ed->hotSwatch = hs;
+                ed->hotAction = ha;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT) {
+                POINT pt;
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
+                if (GroupEditorSwatchAt(ed, pt) >= 0 || GroupEditorActionAt(ed, pt) >= 0) {
+                    SetCursor(LoadCursor(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+            }
+            break;
+        case WM_LBUTTONUP: {
+            POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
+            int hs = GroupEditorSwatchAt(ed, pt);
+            if (hs >= 0) {
+                GroupEditorApplyColor(ed, hs);
+                return 0;
+            }
+            int ha = GroupEditorActionAt(ed, pt);
+            if (ha >= 0) {
+                GroupEditorRunAction(ed, ha); // destroys the window
+                return 0;
+            }
+            return 0;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wp) == WA_INACTIVE && !ed->destroying) {
+                ed->destroying = true;
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        case WM_DESTROY:
+            CommitGroupEditorName(ed);
+            if (ed->editOrigProc && ed->hwndEdit) {
+                SetWindowLongPtr(ed->hwndEdit, GWLP_WNDPROC, (LONG_PTR)ed->editOrigProc);
+            }
+            return 0;
+        case WM_NCDESTROY:
+            if (ed) {
+                if (ed->font) {
+                    DeleteObject(ed->font);
+                }
+                if (ed->editBgBrush) {
+                    DeleteObject(ed->editBgBrush);
+                }
+                delete ed;
+                SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+            }
+            return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// right-clicking a group header band opens a Chrome-style editor for the whole group
+static void ShowVisualTabGroupEditor(MainWindow* win, int groupId, POINT pt) {
+    VisualTabGroup* group = win->visualTabGroups.FindGroup(groupId);
+    if (!group) {
+        return;
+    }
+    HINSTANCE hinst = (HINSTANCE)GetModuleHandleW(nullptr);
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = VisualTabGroupEditorProc;
+        wc.hInstance = hinst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = kGroupEditorClass;
+        RegisterClassExW(&wc);
+        classRegistered = true;
+    }
+
+    auto* ed = new VisualTabGroupEditor();
+    ed->win = win;
+    ed->groupId = groupId;
+    int nPal = 0;
+    VisualTabGroupPalette(&nPal);
+    ed->nSwatch = nPal;
+
+    // compute popup size up front (same DPI as the frame window)
+    HWND frame = win->hwndFrame;
+    int pad = DpiScale(frame, 12);
+    int editH = DpiScale(frame, 26);
+    int sd = DpiScale(frame, 20);
+    int sgap = DpiScale(frame, 9);
+    int rowH = DpiScale(frame, 32);
+    int swatchRowW = nPal * sd + (nPal - 1) * sgap;
+    int minW = DpiScale(frame, 230);
+    int w = swatchRowW + 2 * pad;
+    if (w < minW) {
+        w = minW;
+    }
+    int h = pad + editH + pad + sd + pad + kGroupActCount * rowH + pad;
+
+    // keep the popup on-screen near the click point
+    int x = pt.x;
+    int y = pt.y;
+    RECT wa{};
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    if (x + w > wa.right) {
+        x = wa.right - w;
+    }
+    if (y + h > wa.bottom) {
+        y = wa.bottom - h;
+    }
+    if (x < wa.left) {
+        x = wa.left;
+    }
+    if (y < wa.top) {
+        y = wa.top;
+    }
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kGroupEditorClass, L"", WS_POPUP, x, y, w, h, frame,
+                                nullptr, hinst, ed);
+    if (!hwnd) {
+        delete ed;
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    if (ed->hwndEdit) {
+        SetFocus(ed->hwndEdit);
+        EditSelectAll(ed->hwndEdit);
+    }
+}
+
 static void TabsContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
     TabsCtrl* tabsCtrl = (TabsCtrl*)ev->w;
     TabsCtrl::MouseState tabState = tabsCtrl->TabStateFromMousePosition(ev->mouseWindow);
+    // right-click on a group header band → a Chrome-style editor for the whole group
+    if (tabState.overGroupHeader && tabState.groupId >= 0) {
+        ShowVisualTabGroupEditor(win, tabState.groupId, ToPOINT(ev->mouseScreen));
+        return;
+    }
     int tabIdx = tabState.tabIdx;
     if (tabIdx < 0) {
         return;
@@ -658,6 +1170,14 @@ static void TabsContextMenu(ContextMenuEvent* ev) {
         }
         case CmdRemoveVisualTabGroup: {
             RemoveTabFromVisualGroup(win, tabUnderMouse);
+            return;
+        }
+        case CmdRenameVisualTabGroup: {
+            RenameVisualTabGroupInteractive(win, win->visualTabGroups.FindGroup(tabUnderMouse->visualTabGroupId));
+            return;
+        }
+        case CmdRecolorVisualTabGroup: {
+            RecolorVisualTabGroupInteractive(win, win->visualTabGroups.FindGroup(tabUnderMouse->visualTabGroupId));
             return;
         }
         case CmdClose: {
