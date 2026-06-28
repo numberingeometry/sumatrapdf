@@ -138,16 +138,14 @@ static VisualTabGroup* EnsureVisualTabGroupFromRef(VisualTabGroupState& state, c
         return nullptr;
     }
     VisualTabGroup* group = state.FindGroup(ref.groupId);
-    if (!group) {
-        COLORREF color = ParseColor(ref.color, DefaultVisualTabGroupColor(ref.groupId));
-        group = state.CreateGroupWithId(ref.groupId, ref.name, color);
+    if (group) {
+        // the group still exists and is authoritative — join it as-is. Don't let a saved (possibly
+        // stale) ref clobber the live name/color/collapsed: e.g. reopening a closed tab after the
+        // group was recoloured would otherwise revert the whole group back to the old colour.
+        return group;
     }
-    if (!str::IsEmpty(ref.name)) {
-        str::ReplaceWithCopy(&group->name, ref.name);
-    }
-    if (!str::IsEmpty(ref.color)) {
-        group->color = ParseColor(ref.color, group->color);
-    }
+    COLORREF color = ParseColor(ref.color, DefaultVisualTabGroupColor(ref.groupId));
+    group = state.CreateGroupWithId(ref.groupId, ref.name, color);
     group->collapsed = ref.collapsed;
     return group;
 }
