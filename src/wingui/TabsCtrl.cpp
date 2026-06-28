@@ -34,6 +34,10 @@ constexpr int kMinTabWidthForClose = 64;
 // timer driving the tab-slide animation (drag swap-slide, collapse/expand)
 constexpr UINT_PTR kTabAnimTimerId = 0x7AB;
 
+// easing for the tab/chip slide: each 15ms tick closes 1/N of the remaining distance. Higher N =
+// slower, smoother slide. 3 felt quicker than Chrome; 5 is closer. One-line dial for the feel.
+constexpr int kTabAnimEaseDivisor = 5;
+
 using Gdiplus::Bitmap;
 using Gdiplus::Color;
 using Gdiplus::CompositingQualityHighQuality;
@@ -403,16 +407,66 @@ void TabsCtrl::LayoutTabs() {
     for (int i = 0; i < nTabs; i++) {
         TabInfo* ti = GetTab(i);
         if (ti->rVisible.IsEmpty()) {
-            ti->animInit = false; // hidden: snap into place when it next appears
+            // hidden by collapse. If it was just visible and we're animating, fold it into its
+            // chip as a "ghost" (drawn at its last position, sliding toward the chip) before fully
+            // hiding it — the mirror of the expand slide-out. AnimateTick eases and then hides it.
+            if (ti->animInit && tabsAnimating && ti->visualTabGroupId != -1) {
+                // fold into the chip's RIGHT edge — the members sit to the right of the chip, so
+                // they should shrink back into that side rather than slide across to the left end
+                int chipRight = ti->animX;
+                for (auto& gh : groupHeaders) {
+                    if (gh.groupId == ti->visualTabGroupId) {
+                        chipRight = gh.rHeader.x + gh.rHeader.dx;
+                        break;
+                    }
+                }
+                if (ti->animX != chipRight) {
+                    if (ti->collapseFromX < 0) {
+                        ti->collapseFromX = ti->animX; // capture where the fold began
+                    }
+                    ti->targetX = chipRight;
+                    // shrink the ghost in proportion to total travel, so it narrows from the very
+                    // first frame (no visible full-width slide) and absorbs into the chip
+                    int span = ti->collapseFromX - chipRight;
+                    int rem = ti->animX - chipRight;
+                    int w = (span > 0) ? (tabSize.dx * rem / span) : 0;
+                    if (w < 0) {
+                        w = 0;
+                    }
+                    if (w > tabSize.dx) {
+                        w = tabSize.dx;
+                    }
+                    ti->rVisible = {ti->animX, 0, w, dy};
+                    continue; // keep animInit=true → stays a ghost until it lands on the chip
+                }
+            }
+            ti->animInit = false; // fully hidden
+            ti->collapseFromX = -1;
             continue;
         }
         int slotX = ti->rVisible.x;
         ti->targetX = slotX;
-        bool snap = !tabsAnimating || !ti->animInit || (i == draggedIdx);
-        if (snap) {
-            ti->animX = slotX;
+        bool reappearing = !ti->animInit; // was hidden (e.g. a collapsed group) and is now showing
+        if (reappearing && tabsAnimating && i != draggedIdx && ti->visualTabGroupId != -1) {
+            // expand: start the member at its chip's RIGHT edge (the side it lives on) and let it
+            // slide out to its slot — mirrors the collapse fold-in, instead of emerging from the
+            // chip's left end
+            int chipRight = slotX;
+            for (auto& gh : groupHeaders) {
+                if (gh.groupId == ti->visualTabGroupId) {
+                    chipRight = gh.rHeader.x + gh.rHeader.dx;
+                    break;
+                }
+            }
+            ti->animX = chipRight;
+        } else {
+            bool snap = !tabsAnimating || reappearing || (i == draggedIdx);
+            if (snap) {
+                ti->animX = slotX;
+            }
         }
         ti->animInit = true;
+        ti->collapseFromX = -1; // visible → not folding
         int off = ti->animX - slotX;
         if (off != 0) {
             ti->rVisible.x += off;
@@ -624,6 +678,13 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
     auto inDraggedGroup = [&](int i) -> bool {
         return dragGroupId >= 0 && GetTab(i)->visualTabGroupId == dragGroupId;
     };
+    // a collapse-fold "ghost" is a hidden member still being drawn as it slides into its chip.
+    // It must be drawn UNDER everything (before the chip) so it vanishes behind the banner
+    // instead of its text overlapping the chip.
+    auto isCollapseGhost = [&](int i) -> bool {
+        TabInfo* ti = GetTab(i);
+        return ti && ti->isHiddenByGroupCollapse && !ti->rVisible.IsEmpty();
+    };
 
     // resolves a tab's background fill color (shared by the bg pill and the close-button bg)
     auto tabBgColorOf = [&](int i, bool isSelected, bool isUnderMouse) -> COLORREF {
@@ -722,9 +783,18 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         }
     };
 
+    // collapse-fold ghosts go first, UNDER everything, so they slide behind the chip and the
+    // filled-in tabs and disappear cleanly. Background only — drawing the text would re-layout and
+    // ellipsize every frame as the pill shrinks, which reads as flickering.
+    for (int i = 0; i < n; i++) {
+        if (isCollapseGhost(i)) {
+            paintTabBg(i);
+        }
+    }
+
     // pass 1: all tab backgrounds (the dragged tab/group is skipped and drawn on top at the end)
     for (int i = 0; i < n; i++) {
-        if (i == dragDrawIdx || inDraggedGroup(i)) {
+        if (i == dragDrawIdx || inDraggedGroup(i) || isCollapseGhost(i)) {
             continue;
         }
         paintTabBg(i);
@@ -805,9 +875,10 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         paintGroupHeader(gh);
     }
 
-    // pass 2: all tab foregrounds (the dragged tab/group is skipped and drawn on top at the end)
+    // pass 2: all tab foregrounds (the dragged tab/group and collapse ghosts are skipped — the
+    // ghosts were already drawn under everything above)
     for (int i = 0; i < n; i++) {
-        if (i == dragDrawIdx || inDraggedGroup(i)) {
+        if (i == dragDrawIdx || inDraggedGroup(i) || isCollapseGhost(i)) {
             continue;
         }
         paintTabFg(i);
@@ -1054,9 +1125,14 @@ bool TabsCtrl::AnimateTick() {
         }
         int delta = ti->targetX - ti->animX;
         if (delta == 0) {
+            if (ti->isHiddenByGroupCollapse) {
+                // a collapse-fold ghost reached its chip: fully hide it now
+                ti->rVisible = {};
+                ti->animInit = false;
+            }
             continue;
         }
-        int step = delta / 3;
+        int step = delta / kTabAnimEaseDivisor;
         if (delta >= -2 && delta <= 2) {
             step = delta; // close enough: snap this frame
         } else if (step == 0) {
@@ -1068,8 +1144,36 @@ bool TabsCtrl::AnimateTick() {
         ti->rClose.x += step;
         ti->rCloseHit.x += step;
         ti->titlePos.x += step;
+        if (ti->isHiddenByGroupCollapse) {
+            // folding ghost: shrink its width in proportion to total travel as it nears the chip
+            int span = (ti->collapseFromX >= 0) ? (ti->collapseFromX - ti->targetX) : 0;
+            int rem = ti->animX - ti->targetX;
+            int w = (span > 0) ? (tabSize.dx * rem / span) : 0;
+            if (w <= DpiScale(hwnd, 4)) {
+                // down to a sliver — hide now instead of crawling the last few px. The easing tail
+                // moves only ~1px/tick near the end (integer step), which read as the last tab
+                // "stopping" at the chip then vanishing. Hiding here keeps every tab folding
+                // continuously into the chip, like Chrome.
+                ti->rVisible = {};
+                ti->animInit = false;
+                ti->collapseFromX = -1;
+                continue;
+            }
+            if (w > tabSize.dx) {
+                w = tabSize.dx;
+            }
+            ti->rVisible.x = ti->animX;
+            ti->rVisible.dx = w;
+        }
         if (ti->animX != ti->targetX) {
             anyMoving = true;
+        } else if (ti->isHiddenByGroupCollapse) {
+            // ghost just landed on its chip this frame: hide it now, not on a following tick
+            // (which may never come once everything else has settled — that left a sliver of the
+            // last member sitting on the chip until some unrelated event ticked the timer again)
+            ti->rVisible = {};
+            ti->animInit = false;
+            ti->collapseFromX = -1;
         }
     }
 
@@ -1083,7 +1187,7 @@ bool TabsCtrl::AnimateTick() {
         }
         int delta = a->targetX - a->animX;
         if (delta != 0) {
-            int step = delta / 3;
+            int step = delta / kTabAnimEaseDivisor;
             if (delta >= -2 && delta <= 2) {
                 step = delta; // close enough: snap this frame
             } else if (step == 0) {

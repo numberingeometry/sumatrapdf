@@ -709,6 +709,9 @@ struct TabInfo {
     int animX = 0;
     int targetX = 0;
     bool animInit = false;
+    // collapse-fold: left edge where the fold began, so the ghost's width can shrink in proportion
+    // to total travel (shrinks from the first frame instead of sliding at full width). -1 = none.
+    int collapseFromX = -1;
 };
 
 struct TabsCtrl : Wnd {
