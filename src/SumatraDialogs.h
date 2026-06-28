@@ -74,5 +74,10 @@ struct BgColorResult {
 bool Dialog_ChangeBackgroundColor(HWND hwnd, COLORREF currentColor, bool isCheckered, const char* allFilesLabel,
                                   BgColorResult& result);
 bool Dialog_SetTabColor(HWND hwnd, COLORREF currentColor, bool isUnset, COLORREF& resultColor, bool& resultIsUnset);
+// picks a color for a visual tab group; returns false if the user cancelled
+bool Dialog_SetGroupColor(HWND hwnd, COLORREF currentColor, COLORREF& resultColor);
+// renames a visual tab group; returns the entered name (possibly empty to clear it) or
+// nullptr if the user cancelled. The caller must free() the result.
+char* Dialog_RenameTabGroup(HWND hwnd, const char* currentName);
 
 TempStr ZoomLevelStr(float zoom);

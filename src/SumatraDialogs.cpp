@@ -345,6 +345,80 @@ char* Dialog_GoToPage(HWND hwnd, const char* currentPageLabel, int pageCount, bo
     return str::Dup(data.newPageLabel);
 }
 
+/* For passing data to/from the Rename Tab Group dialog. It reuses the single-edit-box
+   "Go to page" dialog layout, relabeled, so no new dialog resource is needed. */
+struct Dialog_RenameTabGroup_Data {
+    char* currName = nullptr; // current group name (may be empty)
+    char* newName = nullptr;  // name entered by the user (nullptr if cancelled)
+
+    ~Dialog_RenameTabGroup_Data() {
+        str::Free(currName);
+        str::Free(newName);
+    }
+};
+
+static INT_PTR CALLBACK Dialog_RenameTabGroup_Proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
+    HWND editName;
+    Dialog_RenameTabGroup_Data* data;
+
+    //[ ACCESSKEY_GROUP Rename Tab Group Dialog
+    if (WM_INITDIALOG == msg) {
+        data = (Dialog_RenameTabGroup_Data*)lp;
+        SetWindowLongPtr(hDlg, GWLP_USERDATA, (LONG_PTR)data);
+        if (UseDarkModeLib()) {
+            DarkMode::setDarkWndSafe(hDlg);
+        }
+        HwndSetText(hDlg, _TRA("Rename Tab Group"));
+
+        editName = GetDlgItem(hDlg, IDC_GOTO_PAGE_EDIT);
+        // the group name is free text, so drop the page-number ES_NUMBER restriction
+        SetWindowLong(editName, GWL_STYLE, GetWindowLong(editName, GWL_STYLE) & ~ES_NUMBER);
+        HwndSetDlgItemText(hDlg, IDC_GOTO_PAGE_EDIT, data->currName ? data->currName : "");
+        // the "(of N)" page-count label has no meaning when renaming a group
+        HwndSetDlgItemText(hDlg, IDC_GOTO_PAGE_LABEL_OF, "");
+
+        EditSelectAll(editName);
+        HwndSetDlgItemText(hDlg, IDC_STATIC, _TRA("&Group name:"));
+        HwndSetDlgItemText(hDlg, IDOK, _TRA("Rename"));
+        HwndSetDlgItemText(hDlg, IDCANCEL, _TRA("Cancel"));
+
+        CenterDialog(hDlg);
+        HwndSetFocus(editName);
+        return FALSE;
+    }
+    //] ACCESSKEY_GROUP Rename Tab Group Dialog
+
+    char* tmp;
+    switch (msg) {
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDOK:
+                    data = (Dialog_RenameTabGroup_Data*)GetWindowLongPtr(hDlg, GWLP_USERDATA);
+                    editName = GetDlgItem(hDlg, IDC_GOTO_PAGE_EDIT);
+                    tmp = HwndGetTextTemp(editName);
+                    str::ReplaceWithCopy(&data->newName, tmp);
+                    EndDialog(hDlg, IDOK);
+                    return TRUE;
+
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    return TRUE;
+            }
+            break;
+    }
+    return FALSE;
+}
+
+/* Shows a 'rename tab group' dialog and returns the name entered by the user
+   (possibly empty, to clear the name) or nullptr if the user cancelled.
+   The caller must free() the result. */
+char* Dialog_RenameTabGroup(HWND hwnd, const char* currentName) {
+    Dialog_RenameTabGroup_Data data;
+    data.currName = str::Dup(currentName ? currentName : "");
+    CreateDialogBox(IDD_DIALOG_GOTO_PAGE, hwnd, Dialog_RenameTabGroup_Proc, (LPARAM)&data);
+    return str::Dup(data.newName);
+}
+
 /* For passing data to/from Find dialog */
 struct Dialog_Find_Data {
     char* searchTerm;
@@ -1694,6 +1768,25 @@ bool Dialog_SetTabColor(HWND hwnd, COLORREF currentColor, bool isUnset, COLORREF
 
     resultColor = data.currentColor;
     resultIsUnset = data.isCheckered;
+    return true;
+}
+
+bool Dialog_SetGroupColor(HWND hwnd, COLORREF currentColor, COLORREF& resultColor) {
+    BgColorDlgData data;
+    data.currentColor = currentColor;
+    data.isCheckered = false; // a group always has a concrete color
+    data.applyToAll = false;
+    data.selectedCustomIdx = -1;
+    data.previewSelected = true;
+    data.title = _TRA("Set Group Color");
+    data.showRadioButtons = false;
+
+    INT_PTR res = CreateDialogBox(IDD_DIALOG_CHANGE_BG_COLOR, hwnd, Dialog_ChangeBgColor_Proc, (LPARAM)&data);
+    if (res != IDOK) {
+        return false;
+    }
+
+    resultColor = data.currentColor;
     return true;
 }
 
