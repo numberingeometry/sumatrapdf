@@ -379,6 +379,24 @@ void TabsCtrl::LayoutTabs() {
         }
     }
 
+    // when dragging a tab that is the SOLE member of a group, its chip floats with it (just to its
+    // left), so the group stays visually together instead of the chip lagging behind on a "spring".
+    int dragSoleGroupId = -1;
+    if (draggedIdx >= 0 && draggedIdx < nTabs) {
+        int g = GetTab(draggedIdx)->visualTabGroupId;
+        if (g != -1) {
+            int cnt = 0;
+            for (int i = 0; i < nTabs; i++) {
+                if (GetTab(i)->visualTabGroupId == g) {
+                    cnt++;
+                }
+            }
+            if (cnt == 1) {
+                dragSoleGroupId = g;
+            }
+        }
+    }
+
     // tab-slide animation: rVisible.x currently holds each tab's freshly computed slot (its
     // target). When animating, keep the previous animated x and let the timer ease it toward
     // the slot; otherwise snap. The dragged tab always snaps (it tracks the cursor).
@@ -426,6 +444,19 @@ void TabsCtrl::LayoutTabs() {
         int ai = ChipAnimIndex(this, gh.groupId);
         GroupChipAnim& a = groupChipAnims.At(ai);
         int slotX = gh.rHeader.x;
+        if (dragSoleGroupId == gh.groupId && draggedIdx >= 0) {
+            // float this chip just left of its sole member (which tracks the cursor); snap
+            TabInfo* dt = GetTab(draggedIdx);
+            int chipX = dt->rVisible.x - gh.rHeader.dx;
+            int off = chipX - gh.rHeader.x;
+            gh.rHeader.x += off;
+            gh.rCaret.x += off;
+            a.animX = gh.rHeader.x;
+            a.targetX = gh.rHeader.x;
+            a.animInit = true;
+            UpdateGroupUnderline(this, gh, dy);
+            continue;
+        }
         a.targetX = slotX;
         bool snap = !tabsAnimating || !a.animInit;
         if (snap) {
@@ -550,6 +581,10 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
     if (IsValidIdx(tabForceShowSelected)) {
         selectedIdx = tabForceShowSelected;
     }
+    // a selected tab that belongs to a group gets a colored border (Chrome's active-in-group
+    // look) and the group underline gaps under it. This also doubles as live drag-join feedback:
+    // the dragged tab is the selected tab, so it shows the group color the instant it joins.
+    int selGroupId = IsValidIdx(selectedIdx) ? GetTab(selectedIdx)->visualTabGroupId : -1;
 
     Graphics gfx(hdc);
     gfx.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
@@ -619,6 +654,20 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         COLORREF tabBgCol = tabBgColorOf(i, isSelected, isUnderMouse);
         // Chrome-like rounded tabs; a larger radius when active/hovered for a softer feel
         int tabRadius = DpiScale(hwnd, (isSelected || isUnderMouse) ? 9 : 6);
+        // a selected tab in a group gets a colored border (top/left/right) in the group color:
+        // draw the group color as the full pill, then the tab color inset, leaving a border ring
+        if (isSelected && ti->visualTabGroupId != -1) {
+            COLORREF gc = GetGroupHeaderColor(this, ti->visualTabGroupId, tabBgBackground);
+            int bw = DpiScale(hwnd, 3); // match the underline thickness so they read as one frame
+            br.SetColor(GdipCol(gc));
+            FillTopRoundedRect(gfx, br, ti->rVisible, tabRadius);
+            Rect inner = {ti->rVisible.x + bw, ti->rVisible.y + bw, ti->rVisible.dx - 2 * bw,
+                          ti->rVisible.dy - bw};
+            int innerRadius = tabRadius - bw < 1 ? 1 : tabRadius - bw;
+            br.SetColor(GdipCol(tabBgCol));
+            FillTopRoundedRect(gfx, br, inner, innerRadius);
+            return;
+        }
         br.SetColor(GdipCol(tabBgCol));
         FillTopRoundedRect(gfx, br, ti->rVisible, tabRadius);
     };
@@ -688,12 +737,37 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         COLORREF headerBg = AccentColor(headerBase, isHoveredHeader ? 45 : 30);
         COLORREF headerFg = TabTextColorForBackground(headerBg);
 
-        // Chrome-style group underline running across the chip + all member tabs
+        // Chrome-style group underline running across the chip + all member tabs. If the selected
+        // tab belongs to THIS group, gap the underline under it — its border carries the color
+        // instead, so the color wraps continuously around the active tab.
         int ulPad = DpiScale(hwnd, 2);
         int ulDy = DpiScale(hwnd, 3);
-        Rect rUnder = {gh.rTabs.x + ulPad, gh.rTabs.y + gh.rTabs.dy - ulDy, gh.rTabs.dx - 2 * ulPad, ulDy};
-        if (rUnder.dx > 0) {
-            br.SetColor(GdipCol(headerBase));
+        int ulY = gh.rTabs.y + gh.rTabs.dy - ulDy;
+        int ulLeft = gh.rTabs.x + ulPad;
+        int ulRight = gh.rTabs.x + gh.rTabs.dx - ulPad;
+        br.SetColor(GdipCol(headerBase));
+        int gapL = 0, gapR = 0;
+        if (selGroupId == gh.groupId && IsValidIdx(selectedIdx)) {
+            // gap only the INNER span of the selected tab so the underline runs up under its
+            // colored border (inset by the border width); otherwise each segment's rounded inner
+            // end curves away from the border and leaves a small no-color sliver
+            Rect selR = GetTab(selectedIdx)->rVisible;
+            int bw = DpiScale(hwnd, 3);
+            gapL = selR.x + bw;
+            gapR = selR.x + selR.dx - bw;
+        }
+        if (gapR > gapL) {
+            // two segments around the selected tab's gap
+            if (gapL - ulLeft > 0) {
+                Rect r1 = {ulLeft, ulY, gapL - ulLeft, ulDy};
+                FillRoundedRect(gfx, br, r1, ulDy / 2);
+            }
+            if (ulRight - gapR > 0) {
+                Rect r2 = {gapR, ulY, ulRight - gapR, ulDy};
+                FillRoundedRect(gfx, br, r2, ulDy / 2);
+            }
+        } else if (ulRight - ulLeft > 0) {
+            Rect rUnder = {ulLeft, ulY, ulRight - ulLeft, ulDy};
             FillRoundedRect(gfx, br, rUnder, ulDy / 2);
         }
 
@@ -1071,12 +1145,10 @@ static void DragGroupTo(TabsCtrl* tabs, int mouseX) {
         return;
     }
 
-    // Insertion follows the CURSOR. But the block's own visible width must be discounted for tabs
-    // on its RIGHT: you grab the chip on the block's left, so without this, dropping the group past
-    // its right neighbour would require dragging the cursor all the way across the group's own
-    // (expanded) members first — right-drags felt dead while left-drags worked, and collapsed
-    // groups (zero member width) worked both ways. Conceptually: lift the block out, let the
-    // right-side tabs close up, then see where the cursor falls. Symmetric in both directions.
+    // Insertion follows the CURSOR, discounting the block's own visible width for tabs on its RIGHT
+    // (you grab the chip on the block's left, so without this, dropping past the right neighbour
+    // would require dragging across the group's own expanded members first). Conceptually: lift the
+    // block out, let the right-side tabs close up, then see where the cursor falls. Symmetric.
     int visMembers = 0;
     for (int i = first; i < first + count; i++) {
         if (!tabs->GetTab(i)->rVisible.IsEmpty()) {
@@ -1280,6 +1352,22 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (floatCenter <= rightEdge) {
                         newG = leftG; // stays this group's last member
                     }
+                }
+            }
+            // sole-member guard: a one-tab group's only member is never adjacent to a same-group
+            // tab, so the rule above would dissolve the group the instant it's nudged. Keep it
+            // grouped while it's repositioned in-strip (its chip moves with it); tearing it off
+            // (drag-detach) still removes it.
+            int curG = GetTab(from)->visualTabGroupId;
+            if (curG != -1 && newG != curG) {
+                int membersInCurG = 0;
+                for (int i = 0; i < nTabsNow; i++) {
+                    if (GetTab(i)->visualTabGroupId == curG) {
+                        membersInCurG++;
+                    }
+                }
+                if (membersInCurG == 1) {
+                    newG = curG; // don't dissolve a one-tab group just by dragging its tab
                 }
             }
             GetTab(from)->visualTabGroupId = newG;
