@@ -185,6 +185,47 @@ static COLORREF GetGroupHeaderColor(TabsCtrl* tabs, int groupId, COLORREF fallba
     return AccentColor(fallback, 35);
 }
 
+// finds the persistent chip-animation slot for a group, or nullptr
+static TabsCtrl::GroupChipAnim* FindChipAnim(TabsCtrl* tabs, int groupId) {
+    int n = tabs->groupChipAnims.Size();
+    for (int i = 0; i < n; i++) {
+        if (tabs->groupChipAnims.At(i).groupId == groupId) {
+            return &tabs->groupChipAnims.At(i);
+        }
+    }
+    return nullptr;
+}
+
+// index of a group's chip-animation slot, creating it if missing
+static int ChipAnimIndex(TabsCtrl* tabs, int groupId) {
+    int n = tabs->groupChipAnims.Size();
+    for (int i = 0; i < n; i++) {
+        if (tabs->groupChipAnims.At(i).groupId == groupId) {
+            return i;
+        }
+    }
+    TabsCtrl::GroupChipAnim a;
+    a.groupId = groupId;
+    tabs->groupChipAnims.Append(a);
+    return tabs->groupChipAnims.Size() - 1;
+}
+
+// recomputes a group's underline span from the (possibly mid-animation) chip + member rects,
+// so the underline tracks the tabs as they slide instead of snapping to the target slots
+static void UpdateGroupUnderline(TabsCtrl* tabs, TabsCtrl::GroupHeaderInfo& gh, int dy) {
+    int spanLeft = gh.rHeader.x;
+    int spanRight = gh.rHeader.x + gh.rHeader.dx;
+    int n = tabs->TabCount();
+    for (int i = 0; i < n; i++) {
+        TabInfo* t = tabs->GetTab(i);
+        if (t->visualTabGroupId == gh.groupId && !t->rVisible.IsEmpty()) {
+            spanLeft = std::min(spanLeft, t->rVisible.x);
+            spanRight = std::max(spanRight, t->rVisible.x + t->rVisible.dx);
+        }
+    }
+    gh.rTabs = {spanLeft, 0, spanRight - spanLeft, dy};
+}
+
 // Calculates tab's elements, based on its width and height.
 // Generates a GraphicsPath, which is used for painting the tab, etc.
 void TabsCtrl::LayoutTabs() {
@@ -364,6 +405,39 @@ void TabsCtrl::LayoutTabs() {
         }
     }
 
+    // drop chip-animation slots for groups that no longer have a header
+    for (int i = groupChipAnims.Size() - 1; i >= 0; i--) {
+        bool present = false;
+        for (auto& gh : groupHeaders) {
+            if (gh.groupId == groupChipAnims.At(i).groupId) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            groupChipAnims.RemoveAt(i);
+        }
+    }
+
+    // chip-slide animation: the group header chip eases toward its slot exactly like a tab, and
+    // the underline span is recomputed from the *animated* chip + member positions so it tracks
+    // them instead of snapping (fixes the chip/underline lag during animation)
+    for (auto& gh : groupHeaders) {
+        int ai = ChipAnimIndex(this, gh.groupId);
+        GroupChipAnim& a = groupChipAnims.At(ai);
+        int slotX = gh.rHeader.x;
+        a.targetX = slotX;
+        bool snap = !tabsAnimating || !a.animInit;
+        if (snap) {
+            a.animX = slotX;
+        }
+        a.animInit = true;
+        int off = a.animX - slotX;
+        gh.rHeader.x += off;
+        gh.rCaret.x += off;
+        UpdateGroupUnderline(this, gh, dy);
+    }
+
     HwndTabsSetItemSize(hwnd, tabSize);
 }
 
@@ -509,6 +583,12 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
     // close) AFTER the normal paint loops, so a sliding neighbor's text can never bleed over
     // the dragged tab's background. -1 when not dragging in-strip.
     int dragDrawIdx = (draggingTab && !dragDetached) ? GetSelected() : -1;
+    // when dragging a whole group, its chip + members are drawn on top as a unit at the end (same
+    // reason as the single dragged tab) so passing another group doesn't visually interleave
+    int dragGroupId = draggingGroup ? draggedGroupId : -1;
+    auto inDraggedGroup = [&](int i) -> bool {
+        return dragGroupId >= 0 && GetTab(i)->visualTabGroupId == dragGroupId;
+    };
 
     // resolves a tab's background fill color (shared by the bg pill and the close-button bg)
     auto tabBgColorOf = [&](int i, bool isSelected, bool isUnderMouse) -> COLORREF {
@@ -593,16 +673,16 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         }
     };
 
-    // pass 1: all tab backgrounds (the dragged tab is skipped and drawn on top at the end)
+    // pass 1: all tab backgrounds (the dragged tab/group is skipped and drawn on top at the end)
     for (int i = 0; i < n; i++) {
-        if (i == dragDrawIdx) {
+        if (i == dragDrawIdx || inDraggedGroup(i)) {
             continue;
         }
         paintTabBg(i);
     }
 
-    gfx.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-    for (auto& gh : groupHeaders) {
+    // draws one group's underline band + chip pill + label
+    auto paintGroupHeader = [&](GroupHeaderInfo& gh) {
         COLORREF headerBase = GetGroupHeaderColor(this, gh.groupId, tabBgBackground);
         bool isHoveredHeader = tabState.overGroupHeader && tabState.groupId == gh.groupId;
         COLORREF headerBg = AccentColor(headerBase, isHoveredHeader ? 45 : 30);
@@ -641,11 +721,19 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
                 gfx.DrawString(wsHeader, -1, &f, rLabelTxt, &headerSf, &br);
             }
         }
+    };
+
+    gfx.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    for (auto& gh : groupHeaders) {
+        if (dragGroupId >= 0 && gh.groupId == dragGroupId) {
+            continue; // the dragged group is drawn on top at the end
+        }
+        paintGroupHeader(gh);
     }
 
-    // pass 2: all tab foregrounds (the dragged tab is skipped and drawn on top at the end)
+    // pass 2: all tab foregrounds (the dragged tab/group is skipped and drawn on top at the end)
     for (int i = 0; i < n; i++) {
-        if (i == dragDrawIdx) {
+        if (i == dragDrawIdx || inDraggedGroup(i)) {
             continue;
         }
         paintTabFg(i);
@@ -656,6 +744,27 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
     if (dragDrawIdx >= 0) {
         paintTabBg(dragDrawIdx);
         paintTabFg(dragDrawIdx);
+    }
+    // and the dragged group as a unit on top: member backgrounds, then its underline + chip,
+    // then member foregrounds (matching the normal layering), so it never interleaves with a
+    // group it is passing over
+    if (dragGroupId >= 0) {
+        for (int i = 0; i < n; i++) {
+            if (inDraggedGroup(i)) {
+                paintTabBg(i);
+            }
+        }
+        for (auto& gh : groupHeaders) {
+            if (gh.groupId == dragGroupId) {
+                paintGroupHeader(gh);
+                break;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (inDraggedGroup(i)) {
+                paintTabFg(i);
+            }
+        }
     }
 }
 
@@ -834,52 +943,6 @@ void TabsCtrl::MoveTabToIndex(int from, int to) {
     UpdateAfterDrag(this, from, to);
 }
 
-// which group "owns" horizontal position x, ignoring the dragged tab `excludeIdx`:
-// over a group's chip or one of its member tabs → that group; in a gap flanked by the
-// same group → that group; over empty space or an ungrouped tab → none (-1).
-// this lets a member be pulled out of a group by dragging it past the group's edge.
-static int GroupAtX(TabsCtrl* tabs, int excludeIdx, int x) {
-    for (auto& gh : tabs->groupHeaders) {
-        Rect h = gh.rHeader;
-        if (x >= h.x && x < h.x + h.dx) {
-            return gh.groupId;
-        }
-    }
-    int n = tabs->TabCount();
-    for (int i = 0; i < n; i++) {
-        if (i == excludeIdx) {
-            continue;
-        }
-        Rect r = tabs->GetTab(i)->rVisible;
-        if (!r.IsEmpty() && x >= r.x && x < r.x + r.dx) {
-            return tabs->GetTab(i)->visualTabGroupId;
-        }
-    }
-    // in a gap: "inside" a group only if flanked on both sides by the same group
-    int leftG = -1, rightG = -1, bestL = -1000000000, bestR = 1000000000;
-    for (int i = 0; i < n; i++) {
-        if (i == excludeIdx) {
-            continue;
-        }
-        Rect r = tabs->GetTab(i)->rVisible;
-        if (r.IsEmpty()) {
-            continue;
-        }
-        if (r.x + r.dx <= x && r.x > bestL) {
-            bestL = r.x;
-            leftG = tabs->GetTab(i)->visualTabGroupId;
-        }
-        if (r.x >= x && r.x < bestR) {
-            bestR = r.x;
-            rightG = tabs->GetTab(i)->visualTabGroupId;
-        }
-    }
-    if (leftG != -1 && leftG == rightG) {
-        return leftG;
-    }
-    return -1;
-}
-
 // in-strip reorder while dragging: moves the dragged tab to index `to` and selects it,
 // WITHOUT releasing capture / ending the drag or repainting (caller re-lays out)
 void TabsCtrl::ReorderDuringDrag(int from, int to) {
@@ -935,6 +998,32 @@ bool TabsCtrl::AnimateTick() {
             anyMoving = true;
         }
     }
+
+    // ease the group chips toward their slots in the same way, and keep the underline glued to
+    // the now-current chip + member positions
+    int stripDy = ClientRect(hwnd).dy;
+    for (auto& gh : groupHeaders) {
+        GroupChipAnim* a = FindChipAnim(this, gh.groupId);
+        if (!a) {
+            continue;
+        }
+        int delta = a->targetX - a->animX;
+        if (delta != 0) {
+            int step = delta / 3;
+            if (delta >= -2 && delta <= 2) {
+                step = delta; // close enough: snap this frame
+            } else if (step == 0) {
+                step = (delta > 0) ? 1 : -1;
+            }
+            a->animX += step;
+            gh.rHeader.x += step;
+            gh.rCaret.x += step;
+            if (a->animX != a->targetX) {
+                anyMoving = true;
+            }
+        }
+        UpdateGroupUnderline(this, gh, stripDy);
+    }
     return anyMoving;
 }
 
@@ -959,6 +1048,118 @@ LRESULT TabsCtrl::OnNotifyReflect(WPARAM wp, LPARAM lp) {
 static bool CanDragTab(TabInfo* tab) {
     if (tab->isPinned) return false;
     return true;
+}
+
+// Moves the dragged group's whole contiguous block of tabs to the position under the cursor,
+// reordering the TabInfo Vec (which is the source of truth for tab order, so the app's
+// WindowTab order follows automatically). The block never splits another group. Reuses the
+// tab-slide animation so the group slides to its new place.
+static void DragGroupTo(TabsCtrl* tabs, int mouseX) {
+    int gid = tabs->draggedGroupId;
+    int n = tabs->TabCount();
+    int first = -1, count = 0;
+    for (int i = 0; i < n; i++) {
+        if (tabs->GetTab(i)->visualTabGroupId == gid) {
+            if (first < 0) {
+                first = i;
+            }
+            count++;
+        }
+    }
+    if (first < 0 || count == 0) {
+        tabs->draggingGroup = false; // group vanished mid-drag
+        return;
+    }
+
+    // Insertion follows the CURSOR. But the block's own visible width must be discounted for tabs
+    // on its RIGHT: you grab the chip on the block's left, so without this, dropping the group past
+    // its right neighbour would require dragging the cursor all the way across the group's own
+    // (expanded) members first — right-drags felt dead while left-drags worked, and collapsed
+    // groups (zero member width) worked both ways. Conceptually: lift the block out, let the
+    // right-side tabs close up, then see where the cursor falls. Symmetric in both directions.
+    int visMembers = 0;
+    for (int i = first; i < first + count; i++) {
+        if (!tabs->GetTab(i)->rVisible.IsEmpty()) {
+            visMembers++;
+        }
+    }
+    int blockLayoutW = GroupChipDx(tabs, gid) + visMembers * tabs->tabSize.dx;
+    int target = 0;
+    for (int i = 0; i < n; i++) {
+        if (i >= first && i < first + count) {
+            continue;
+        }
+        TabInfo* t = tabs->GetTab(i);
+        if (t->rVisible.IsEmpty()) {
+            continue;
+        }
+        int c = t->targetX + t->rVisible.dx / 2;
+        if (i >= first + count) {
+            c -= blockLayoutW; // a right-side tab closes up by the block's width when it lifts out
+        }
+        if (mouseX > c) {
+            target++;
+        }
+    }
+
+    // collect block + others (skip the block itself)
+    Vec<TabInfo*> block, others;
+    for (int i = 0; i < n; i++) {
+        TabInfo* t = tabs->GetTab(i);
+        if (i >= first && i < first + count) {
+            block.Append(t);
+        } else {
+            others.Append(t);
+        }
+    }
+    if (target < 0) {
+        target = 0;
+    }
+    if (target > others.Size()) {
+        target = others.Size();
+    }
+    // never split another group: if the insertion point lands inside another group's run, snap it
+    // to the NEARER edge (not always forward) so the dragged group passes cleanly in either
+    // direction. Pushing only forward shoved a leftward drag back past the group every frame, so
+    // it could never reach the near side and got stuck straddling it.
+    if (target > 0 && target < others.Size()) {
+        int gH = others.At(target - 1)->visualTabGroupId;
+        if (gH != -1 && others.At(target)->visualTabGroupId == gH) {
+            int runStart = target;
+            int runEnd = target;
+            while (runStart > 0 && others.At(runStart - 1)->visualTabGroupId == gH) {
+                runStart--;
+            }
+            while (runEnd < others.Size() && others.At(runEnd)->visualTabGroupId == gH) {
+                runEnd++;
+            }
+            target = (target - runStart <= runEnd - target) ? runStart : runEnd;
+        }
+    }
+    if (target == first) {
+        return; // already there — nothing to do, no re-layout churn
+    }
+
+    TabInfo* selTab = (tabs->GetSelected() >= 0) ? tabs->GetTab(tabs->GetSelected()) : nullptr;
+    tabs->tabs.Reset();
+    for (int i = 0; i < target; i++) {
+        tabs->tabs.Append(others.At(i));
+    }
+    for (int i = 0; i < block.Size(); i++) {
+        tabs->tabs.Append(block.At(i));
+    }
+    for (int i = target; i < others.Size(); i++) {
+        tabs->tabs.Append(others.At(i));
+    }
+    int newSel = selTab ? tabs->tabs.Find(selTab) : -1;
+    SendMessageW(tabs->hwnd, WM_SETREDRAW, FALSE, 0);
+    if (newSel >= 0) {
+        TabCtrl_SetCurSel(tabs->hwnd, newSel);
+    }
+    SendMessageW(tabs->hwnd, WM_SETREDRAW, TRUE, 0);
+    tabs->StartTabAnimation();
+    tabs->LayoutTabs();
+    HwndScheduleRepaint(tabs->hwnd);
 }
 
 LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1039,12 +1240,71 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ReorderDuringDrag(from, target);
                 from = GetSelected();
             }
-            GetTab(from)->visualTabGroupId = GroupAtX(this, from, floatCenter);
+            // Resolve the dragged tab's group from its ORDER neighbours (for contiguity) plus the
+            // banner position (for the "cross the chip" feel). Membership is only ever assigned
+            // when the tab is adjacent to that group's run, so members stay contiguous and the
+            // underline can never stretch across non-members (the right→left runaway bug). Within
+            // that, the banner (chip) position decides the edge, symmetrically:
+            //   - tab just left of group G (its potential first member): joins once its centre
+            //     reaches G's chip centre  → "cross the banner from the left to join"
+            //   - tab just right of group G (its potential last member): stays until its centre
+            //     passes G's right edge      → "cross the banner from the right to leave"
+            // Crossing a banner is therefore one clean chip<->tab swap in either direction.
+            int nTabsNow = TabCount();
+            int leftG = (from - 1 >= 0) ? GetTab(from - 1)->visualTabGroupId : -1;
+            int rightG = (from + 1 < nTabsNow) ? GetTab(from + 1)->visualTabGroupId : -1;
+            int newG = -1;
+            if (leftG != -1 && leftG == rightG) {
+                newG = leftG; // strictly inside a group's run
+            } else {
+                if (rightG != -1) {
+                    for (auto& gh : groupHeaders) {
+                        if (gh.groupId == rightG) {
+                            int chipCenter = gh.rHeader.x + gh.rHeader.dx / 2;
+                            if (floatCenter >= chipCenter) {
+                                newG = rightG; // becomes this group's first member
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (newG == -1 && leftG != -1) {
+                    // boundary = the last *other* member's right edge (the dragged tab is at this
+                    // group's right end, so its left neighbour is that member). Excluding the
+                    // dragged tab is essential: using the group's own band includes the dragged tab,
+                    // so the boundary would follow it forever and it could never leave to the right.
+                    // Stay a member only while the dragged tab still overlaps that member; once its
+                    // centre passes it, drop out — even into empty space, matching Chrome.
+                    TabInfo* lastOther = GetTab(from - 1);
+                    int rightEdge = lastOther->targetX + lastOther->rVisible.dx;
+                    if (floatCenter <= rightEdge) {
+                        newG = leftG; // stays this group's last member
+                    }
+                }
+            }
+            GetTab(from)->visualTabGroupId = newG;
             StartTabAnimation(); // neighbours slide to their new slots
             LayoutTabs();
             HwndScheduleRepaint(hwnd);
         }
         return 0;
+    }
+
+    // group-header drag: once the press passes the threshold, move the whole group
+    if (msg == WM_MOUSEMOVE && GetCapture() == hwnd && groupPressId >= 0) {
+        if (!draggingGroup) {
+            int cxDrag = GetSystemMetrics(SM_CXDRAG);
+            if (abs(mousePos.x - dragMouseX) > cxDrag) {
+                draggingGroup = true;
+                draggedGroupId = groupPressId;
+            }
+        }
+        if (draggingGroup) {
+            dragMouseX = mousePos.x;
+            DragGroupTo(this, mousePos.x);
+            return 0;
+        }
+        return 0; // pressed on a header but not yet a drag
     }
 
     // Check if mouse has moved beyond system drag threshold
@@ -1154,8 +1414,18 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 tabHighlighted = -1;
                 tabHighlightedClose = -1;
                 tabBeingClosed = -1;
-                TriggerGroupHeaderClick(this, tabState.groupId);
-                HwndScheduleRepaint(hwnd);
+                // pending group press: a drag moves the whole group, a click (no drag)
+                // collapses/expands it on button-up
+                groupPressId = tabState.groupId;
+                for (auto& gh : groupHeaders) {
+                    if (gh.groupId == groupPressId) {
+                        grabLocation.x = mousePos.x - gh.rHeader.x;
+                        grabLocation.y = mousePos.y - gh.rHeader.y;
+                        break;
+                    }
+                }
+                dragMouseX = mousePos.x; // press anchor for the drag threshold
+                SetCapture(hwnd);
                 return 0;
             }
             tabHighlighted = tabUnderMouse;
@@ -1194,6 +1464,23 @@ LRESULT TabsCtrl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool isDragging = (GetCapture() == hwnd);
             if (isDragging) {
                 ReleaseCapture();
+            }
+            // group-header press resolves here: a drag committed a whole-group move (the Vec
+            // is already reordered), a plain click toggles collapse/expand
+            if (groupPressId >= 0) {
+                int gid = groupPressId;
+                bool wasDrag = draggingGroup;
+                groupPressId = -1;
+                draggingGroup = false;
+                draggedGroupId = -1;
+                if (wasDrag) {
+                    StartTabAnimation(); // settle the group into its dropped slot
+                    HwndScheduleRepaint(hwnd);
+                } else {
+                    TriggerGroupHeaderClick(this, gid); // click → collapse/expand
+                    HwndScheduleRepaint(hwnd);
+                }
+                return 0;
             }
             if (tabBeingClosed != -1 && tabUnderMouse == tabBeingClosed && overClose) {
                 // freeze tab widths so next close button stays under cursor

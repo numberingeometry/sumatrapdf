@@ -798,13 +798,29 @@ struct TabsCtrl : Wnd {
     bool dragDetached = false;
     // cursor x (client coords) during an in-strip drag; the dragged tab follows it
     int dragMouseX = 0;
+    // group-header drag: a header press may become a whole-group move (drag) or a
+    // collapse/expand (click). groupPressId is the pressed group (-1 = none); draggingGroup
+    // turns on once the press passes the drag threshold; draggedGroupId is the moving group.
+    int groupPressId = -1;
+    bool draggingGroup = false;
+    int draggedGroupId = -1;
     // true while tabs are easing toward their slots (drag swap-slide / collapse-expand)
     bool tabsAnimating = false;
     // dx of tab if there's more space available
     int tabDefaultDx = 300;
 
+    // persistent per-group chip animation state, so the group header slides like a tab
+    // (groupHeaders is rebuilt every layout, so the eased position has to live here)
+    struct GroupChipAnim {
+        int groupId = -1;
+        int animX = 0;
+        int targetX = 0;
+        bool animInit = false;
+    };
+
     Vec<TabInfo*> tabs;
     Vec<GroupHeaderInfo> groupHeaders;
+    Vec<GroupChipAnim> groupChipAnims;
 
     // tracking state of which tab is highlighted etc.
     int tabHighlighted = -1;
