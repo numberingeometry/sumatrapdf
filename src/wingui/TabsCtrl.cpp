@@ -609,6 +609,40 @@ static void FillTopRoundedRect(Graphics& gfx, SolidBrush& br, Rect r, int radius
     gfx.SetSmoothingMode(prev);
 }
 
+// like FillTopRoundedRect but the two bottom corners flare outward into concave "feet" (the Chrome
+// active-tab silhouette). The feet extend `foot` px beyond r's sides at the baseline, so a group-
+// colored frame drawn with this shape sweeps continuously down into the horizontal group underline.
+// Because the feet spill outside r, draw this AFTER the underline and neighboring tabs (z-order).
+static void FillFlaredTab(Graphics& gfx, SolidBrush& br, Rect r, int topRadius, int foot) {
+    topRadius = std::min(topRadius, std::min(r.dx, r.dy) / 2);
+    if (topRadius < 1) {
+        topRadius = 1;
+    }
+    foot = std::min(foot, r.dy / 3);
+    if (foot < 1) {
+        foot = 1;
+    }
+    int td = topRadius * 2;
+    int fd = foot * 2;
+    int left = r.x;
+    int right = r.x + r.dx;
+    int top = r.y;
+    int bot = r.y + r.dy;
+    // clockwise: top-left corner -> across the top -> top-right corner -> down the right side ->
+    // right foot -> across the baseline -> left foot -> (CloseFigure draws the left side back up).
+    // AddArc auto-connects each arc's start to the previous point, so the straight runs are implicit.
+    GraphicsPath path;
+    path.AddArc(left, top, td, td, 180, 90);           // top-left corner (convex)
+    path.AddArc(right - td, top, td, td, 270, 90);     // top-right corner (convex)
+    path.AddArc(right, bot - fd, fd, fd, 180, -90);    // right foot (concave, flares out + down)
+    path.AddArc(left - fd, bot - fd, fd, fd, 90, -90); // left foot (concave, flares out + down)
+    path.CloseFigure();
+    Gdiplus::SmoothingMode prev = gfx.GetSmoothingMode();
+    gfx.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    gfx.FillPath(&br, &path);
+    gfx.SetSmoothingMode(prev);
+}
+
 static COLORREF TabTextColorForBackground(COLORREF tabBg) {
     COLORREF text = ThemeWindowTextColor();
     if (abs((int)GetLightness(text) - (int)GetLightness(tabBg)) >= 80) {
@@ -715,18 +749,33 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         COLORREF tabBgCol = tabBgColorOf(i, isSelected, isUnderMouse);
         // Chrome-like rounded tabs; a larger radius when active/hovered for a softer feel
         int tabRadius = DpiScale(hwnd, (isSelected || isUnderMouse) ? 9 : 6);
-        // a selected tab in a group gets a colored border (top/left/right) in the group color:
-        // draw the group color as the full pill, then the tab color inset, leaving a border ring
+        // a selected tab in a group gets a colored border (top/left/right) in the group color, with
+        // Chrome-style concave feet at the bottom that flow into the group underline: draw the group
+        // color as the full flared silhouette, then the tab color inset, leaving a border ring + feet.
+        // (This branch is drawn on top of the underline in Paint() so the outward feet aren't clipped.)
         if (isSelected && ti->visualTabGroupId != -1) {
             COLORREF gc = GetGroupHeaderColor(this, ti->visualTabGroupId, tabBgBackground);
-            int bw = DpiScale(hwnd, 3); // match the underline thickness so they read as one frame
+            int bw = DpiScale(hwnd, 3);   // match the underline thickness so they read as one frame
+            int foot = DpiScale(hwnd, 8); // how far the feet flare past the tab's sides
             br.SetColor(GdipCol(gc));
-            FillTopRoundedRect(gfx, br, ti->rVisible, tabRadius);
+            FillFlaredTab(gfx, br, ti->rVisible, tabRadius, foot);
             Rect inner = {ti->rVisible.x + bw, ti->rVisible.y + bw, ti->rVisible.dx - 2 * bw,
                           ti->rVisible.dy - bw};
             int innerRadius = tabRadius - bw < 1 ? 1 : tabRadius - bw;
+            int innerFoot = foot - bw < 1 ? 1 : foot - bw;
             br.SetColor(GdipCol(tabBgCol));
-            FillTopRoundedRect(gfx, br, inner, innerRadius);
+            // flare the interior too (not just the thin colored border) so the whole tab body reads
+            // as a Chrome foot flowing into the underline, instead of a square-cornered body
+            FillFlaredTab(gfx, br, inner, innerRadius, innerFoot);
+            return;
+        }
+        // the active tab always gets the Chrome flared foot, group or not; when it isn't in a group
+        // the feet simply sweep onto the tab strip (no underline to flow into). Like the grouped
+        // case, it's drawn on top of its neighbors in Paint() so the outward feet aren't clipped.
+        if (isSelected) {
+            int foot = DpiScale(hwnd, 8);
+            br.SetColor(GdipCol(tabBgCol));
+            FillFlaredTab(gfx, br, ti->rVisible, tabRadius, foot);
             return;
         }
         br.SetColor(GdipCol(tabBgCol));
@@ -792,9 +841,17 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
         }
     }
 
-    // pass 1: all tab backgrounds (the dragged tab/group is skipped and drawn on top at the end)
+    // the active tab has flared feet that spill outside its rect and must sit on top of its
+    // neighbors (and, if grouped, the underline), so it's drawn in its own pass below, not in pass 1.
+    bool activeOnTop = IsValidIdx(selectedIdx);
+
+    // pass 1: all tab backgrounds (the dragged tab/group and the active tab are skipped and drawn on
+    // top later)
     for (int i = 0; i < n; i++) {
         if (i == dragDrawIdx || inDraggedGroup(i) || isCollapseGhost(i)) {
+            continue;
+        }
+        if (activeOnTop && i == selectedIdx) {
             continue;
         }
         paintTabBg(i);
@@ -873,6 +930,13 @@ void TabsCtrl::Paint(HDC hdc, const RECT& rc) {
             continue; // the dragged group is drawn on top at the end
         }
         paintGroupHeader(gh);
+    }
+
+    // now the active tab's background, on top of neighbors (and, when grouped, the underline) so its
+    // flared feet sweep down as one continuous silhouette. Skipped if it's the dragged tab/group
+    // (drawn on top below instead) — otherwise it'd be painted twice, at the wrong slot.
+    if (activeOnTop && selectedIdx != dragDrawIdx && !inDraggedGroup(selectedIdx)) {
+        paintTabBg(selectedIdx);
     }
 
     // pass 2: all tab foregrounds (the dragged tab/group and collapse ghosts are skipped — the
